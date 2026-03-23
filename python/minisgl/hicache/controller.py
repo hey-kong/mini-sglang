@@ -91,6 +91,21 @@ class HiCacheTransferMixin:
             indices_src=host_indices,
         )
 
+    def load_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        from minisgl.kernel import transfer_hicache_all_layer
+
+        transfer_hicache_all_layer(
+            k_ptr_dst=self._cuda_k_ptrs,
+            v_ptr_dst=self._cuda_v_ptrs,
+            indices_dst=cuda_indices,
+            k_ptr_src=self._host_k_ptrs,
+            v_ptr_src=self._host_v_ptrs,
+            indices_src=host_indices,
+            kv_cache_dst_stride_bytes=self._cuda_stride_bytes,
+            kv_cache_src_stride_bytes=self._host_stride_bytes,
+            element_size=self._element_bytes,
+        )
+
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_layer
 
@@ -117,6 +132,13 @@ class HiCacheController(HiCacheTransferMixin):
         self.ack_cnt = 0
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
+        self.use_layerwise = config.use_layerwise
+        self.page_size = config.page_size
+        self.use_pagewise_load = (
+            not self.use_layerwise
+            and config.device_mem_layout == "page_first"
+            and config.host_mem_layout == "page_first"
+        )
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
@@ -166,17 +188,32 @@ class HiCacheController(HiCacheTransferMixin):
             return self.cuda_pool.set_hicache_counter(None)
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
-        self.cuda_pool.set_hicache_counter(counter)
+        self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
         host_indices, cuda_indices = self._merge_transactions(self.load_queue)
         num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
-            for i in range(self.num_layers):
-                self.load_one(host_indices, cuda_indices, i)
-                counter.events[i].record(self.load_stream)
+            if self.use_pagewise_load:
+                # Page-first + non-layerwise mode prefers page-by-page transfer with all layers
+                # to avoid slow fine-grained per-layer load_one copies.
+                for i in range(0, num_tokens, self.page_size):
+                    self.load_all(
+                        host_indices=host_indices[i : i + self.page_size],
+                        cuda_indices=cuda_indices[i : i + self.page_size],
+                    )
+            else:
+                for i in range(self.num_layers):
+                    self.load_one(host_indices, cuda_indices, i)
+                    counter.events[i].record(self.load_stream)
             finish_event = counter.events[-1]
+            if self.use_pagewise_load:
+                finish_event.record(self.load_stream)
+            if not self.use_layerwise:
+                # Force full host->HBM transfer completion before model forward starts.
+                # This matches radix-like behavior: KV cache is fully in HBM for compute.
+                current_stream.wait_event(finish_event)
 
         # NOTE: must record here to avoid use after free
         host_indices.record_stream(self.load_stream)
