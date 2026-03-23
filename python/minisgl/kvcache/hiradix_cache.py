@@ -297,7 +297,6 @@ class HiRadixPrefixCache(BasePrefixCache):
         result: List[torch.Tensor] = []
         self.evictable_size += node.length  # update evictable size first
         while not node.is_root() and node.on_host_only():
-            assert node.ref_count == 0
             node.cuda_value = indices[-node.length :]
             indices = indices[: -node.length]
             result.append(node.host_value)
