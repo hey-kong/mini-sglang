@@ -24,9 +24,13 @@ class CacheManager:
         self.page_size = page_size = config.page_size
         self.device = device = page_table.device
         self.num_pages = num_pages
+        self.disable_radix = config.disable_radix
         self.enable_hicache = config.cache_type == "hiradix"
         self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         self._prefix_cache = create_prefix_cache(device=device, type=config.cache_type)
+        self._empty_cuda_handle = self._prefix_cache.match_prefix(
+            torch.empty(0, dtype=torch.int32, device=device)
+        ).cuda_handle
         if self.enable_hicache:
             from minisgl.hicache import HiCacheController
 
@@ -46,7 +50,15 @@ class CacheManager:
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        return self._prefix_cache.match_prefix(req.input_ids[: input_len - 1])
+        result = self._prefix_cache.match_prefix(req.input_ids[: input_len - 1])
+        if not self.disable_radix:
+            return result
+        if not self.enable_hicache:
+            return MatchResult(cuda_handle=self._empty_cuda_handle, host_handle=None)
+        host_handle = result.host_handle
+        if host_handle is None or host_handle.cached_len == 0:
+            return MatchResult(cuda_handle=self._empty_cuda_handle, host_handle=None)
+        return MatchResult(cuda_handle=self._empty_cuda_handle, host_handle=host_handle)
 
     @property
     def available_size(self) -> int:

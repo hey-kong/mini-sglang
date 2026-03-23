@@ -209,6 +209,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="The KV cache management strategy.",
     )
+    parser.add_argument(
+        "--disable-radix",
+        action="store_true",
+        default=ServerArgs.disable_radix,
+        help="Disable GPU/HBM prefix cache hits. With cache_type=hiradix, DRAM host hits remain enabled.",
+    )
 
     parser.add_argument(
         "--moe-backend",
