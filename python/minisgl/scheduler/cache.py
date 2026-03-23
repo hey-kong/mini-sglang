@@ -41,7 +41,6 @@ class CacheManager:
             assert isinstance(self._hiradix_cache, HiRadixPrefixCache)
             self._hicache_controller = HiCacheController(self._prefix_cache, num_pages, config)
             self.start_load_host = self._hicache_controller.start_load
-            self.refresh_hicache = self._hicache_controller.refresh
 
     def prepare_load_host(self, host_handle: BaseCacheHandle, cuda_handle: BaseCacheHandle):
         needed_len = host_handle.cached_len - cuda_handle.cached_len
@@ -53,6 +52,11 @@ class CacheManager:
         indices = self._page_to_token(self._allocate(needed_len // self.page_size))
         self._hicache_controller.prepare_load(host_handle, cuda_handle, indices)
         return host_handle
+
+    def refresh_hicache(self, tp_cpu_group) -> None:
+        recycled = self._hicache_controller.refresh(tp_cpu_group)
+        if recycled is not None:
+            self._free(recycled)
 
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len

@@ -110,6 +110,7 @@ class HiCacheTransferMixin:
 class HiCacheController(HiCacheTransferMixin):
     def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
         self.hiradix_cache = cast("HiRadixPrefixCache", prefix_cache)
+        self.disable_radix = config.disable_radix
         self.load_queue: List[Transaction] = []
         self.write_queue: List[Transaction] = []
         self.ack_load_queue: List[Ack] = []
@@ -210,7 +211,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.ack_write_queue.append(Ack(ack_id, handles, num_tokens, start_event, finish_event))
         logger.info_rank0(f"HiCache Write [{ack_id}]: {num_tokens:>5} tokens")
 
-    def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
+    def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> torch.Tensor | None:
         # NOTE: load has no side-effect (only logging), so no need to sync
         finish_count = 0
         for ack in self.ack_load_queue:
@@ -231,11 +232,17 @@ class HiCacheController(HiCacheTransferMixin):
         dist.all_reduce(finish_count, op=dist.ReduceOp.MIN, group=tp_cpu_group)
         finish_count = int(finish_count)
 
+        recycled_cuda_indices: List[torch.Tensor] = []
         for ack in self.ack_write_queue[:finish_count]:
             self._log_transaction(ack, "Write")
             for handle in ack.handles:
                 self.hiradix_cache.lock_handle(handle, unlock=True)
+                if self.disable_radix:
+                    recycled_cuda_indices.extend(self.hiradix_cache.demote_cuda(handle))
         self.ack_write_queue = self.ack_write_queue[finish_count:]
+        if not recycled_cuda_indices:
+            return None
+        return torch.cat(recycled_cuda_indices)
 
     def _merge_transactions(self, txs: List[Transaction]):
         assert len(txs) > 0

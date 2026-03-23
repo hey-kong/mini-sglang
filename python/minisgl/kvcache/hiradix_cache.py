@@ -306,6 +306,22 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
+    def demote_cuda(self, handle: BaseCacheHandle) -> List[torch.Tensor]:
+        assert isinstance(handle, HiRadixCacheHandle)
+        node = handle.node
+        result: List[torch.Tensor] = []
+        while not node.is_root():
+            if node._cuda_value is not None and node._host_value is not None:
+                if node.ref_count == 0:
+                    self.evictable_size -= node.length
+                else:
+                    self.protected_size -= node.length
+                result.append(node.cuda_value)
+                node.cuda_value = None
+            node = node.parent
+        result.reverse()
+        return result
+
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
 
