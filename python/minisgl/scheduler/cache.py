@@ -65,9 +65,6 @@ class CacheManager:
         host_handle = result.host_handle
         if host_handle is None or host_handle.cached_len == 0:
             return MatchResult(cuda_handle=self._empty_cuda_handle, host_handle=None)
-        if self._hiradix_cache.get_load_length(host_handle) == 0:
-            # No host-only region to load back; fall back to existing cuda match.
-            return result
         return MatchResult(cuda_handle=self._empty_cuda_handle, host_handle=host_handle)
 
     @property
