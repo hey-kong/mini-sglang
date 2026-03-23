@@ -9,6 +9,8 @@ from minisgl.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from minisgl.utils import div_ceil
 
 if TYPE_CHECKING:
+    from minisgl.kvcache.hiradix_cache import HiRadixPrefixCache
+
     from .config import SchedulerConfig
     from .utils import PendingReq
 
@@ -33,13 +35,18 @@ class CacheManager:
         ).cuda_handle
         if self.enable_hicache:
             from minisgl.hicache import HiCacheController
+            from minisgl.kvcache.hiradix_cache import HiRadixPrefixCache
 
+            self._hiradix_cache = self._prefix_cache
+            assert isinstance(self._hiradix_cache, HiRadixPrefixCache)
             self._hicache_controller = HiCacheController(self._prefix_cache, num_pages, config)
             self.start_load_host = self._hicache_controller.start_load
             self.refresh_hicache = self._hicache_controller.refresh
 
     def prepare_load_host(self, host_handle: BaseCacheHandle, cuda_handle: BaseCacheHandle):
         needed_len = host_handle.cached_len - cuda_handle.cached_len
+        if self.disable_radix and self.enable_hicache and cuda_handle.cached_len == 0:
+            needed_len = self._hiradix_cache.get_load_length(host_handle)
         if needed_len < HICACHE_LOAD_LENGTH_THRESHOLD:
             return cuda_handle
         assert needed_len % self.page_size == 0, "allocation must be page-aliged"

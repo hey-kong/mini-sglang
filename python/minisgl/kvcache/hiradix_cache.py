@@ -269,6 +269,15 @@ class HiRadixPrefixCache(BasePrefixCache):
             node = node.parent
         return needed_len
 
+    def get_load_length(self, handle: BaseCacheHandle) -> int:
+        assert isinstance(handle, HiRadixCacheHandle)
+        node = handle.node
+        needed_len = 0
+        while not node.is_root() and node.on_host_only():
+            needed_len += node.length
+            node = node.parent
+        return needed_len
+
     def set_host(self, handle: BaseCacheHandle, indices: torch.Tensor) -> List[torch.Tensor]:
         assert isinstance(handle, HiRadixCacheHandle)
         node = handle.node
