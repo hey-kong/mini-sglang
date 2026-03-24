@@ -56,7 +56,6 @@ class Ack(NamedTuple):
 RING_SIZE = 3  # 3 is enough and safe
 WRITE_LENGTH_THRESHOLD = 64
 RESET_ACK_THRESHOLD = 512
-LOAD_PARALLEL_STREAMS = 4
 
 
 class HiCacheTransferMixin:
@@ -68,7 +67,6 @@ class HiCacheTransferMixin:
     ) -> None:
         self.load_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
-        self.load_parallel_streams = [torch.cuda.Stream() for _ in range(LOAD_PARALLEL_STREAMS)]
         self.load_stream_ctx = torch.cuda.stream(self.load_stream)
         self.write_stream_ctx = torch.cuda.stream(self.write_stream)
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
@@ -190,10 +188,9 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices: torch.Tensor,
     ) -> None:
         host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
-        cuda_list = self._split_by_lengths(cuda_indices, host_list)
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
-        self.load_queue.append(Transaction(host_handle, host_list, cuda_list))
+        self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
@@ -204,9 +201,8 @@ class HiCacheController(HiCacheTransferMixin):
             return
         assert len(host_indices) == needed_len
         cuda_list = self.hiradix_cache.set_host(cuda_handle, host_indices)
-        host_list = self._split_by_lengths(host_indices, cuda_list)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
-        self.write_queue.append(Transaction(cuda_handle, host_list, cuda_list))
+        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list))
         self.start_write()  # do not batch write for now
 
     def start_load(self) -> None:
@@ -217,30 +213,15 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
         host_indices, cuda_indices = self._merge_transactions(self.load_queue)
         num_tokens = len(host_indices)
-        active_streams: List[torch.cuda.Stream] = []
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             if not self.use_layerwise:
+                self.load_stream.wait_stream(current_stream)
                 if self.enable_page_first_bulk_load:
-                    self.load_stream.wait_stream(current_stream)
                     self.load_all_bulk(host_indices=host_indices, cuda_indices=cuda_indices)
                 else:
-                    chunks = list(self._iter_contiguous_chunks(host_indices, cuda_indices))
-                    active_streams = self.load_parallel_streams[
-                        : min(len(chunks), len(self.load_parallel_streams))
-                    ]
-                    for stream in active_streams:
-                        stream.wait_stream(current_stream)
-                    for i, (host_chunk, cuda_chunk) in enumerate(chunks):
-                        stream = active_streams[i % len(active_streams)]
-                        with torch.cuda.stream(stream):
-                            self.load_all(
-                                host_indices=host_chunk,
-                                cuda_indices=cuda_chunk,
-                            )
-                    for stream in active_streams:
-                        self.load_stream.wait_stream(stream)
+                    self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 self.load_stream.wait_stream(current_stream)
                 for i in range(self.num_layers):
@@ -254,10 +235,6 @@ class HiCacheController(HiCacheTransferMixin):
                 current_stream.wait_event(finish_event)
 
         # NOTE: must record here to avoid use after free
-        if not self.use_layerwise:
-            for stream in active_streams:
-                host_indices.record_stream(stream)
-                cuda_indices.record_stream(stream)
         host_indices.record_stream(self.load_stream)
         cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
@@ -325,42 +302,6 @@ class HiCacheController(HiCacheTransferMixin):
             cuda_list.extend(cuda_values)
         host_indices, cuda_indices = torch.cat(host_list), torch.cat(cuda_list)
         return host_indices.to(self.device, non_blocking=True), cuda_indices
-
-    def _split_by_lengths(self, indices: torch.Tensor, refs: List[torch.Tensor]) -> List[torch.Tensor]:
-        if len(refs) == 0:
-            return []
-        result: List[torch.Tensor] = []
-        offset = 0
-        for ref in refs:
-            length = len(ref)
-            result.append(indices[offset : offset + length])
-            offset += length
-        assert offset == len(indices), "Length mismatch between indices and hiradix node values."
-        return result
-
-    def _iter_contiguous_chunks(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor):
-        # `torch.cat` only appends transaction fragments; it does not guarantee contiguous
-        # host/cuda slots. Build maximal chunks where both sides are physically contiguous.
-        assert len(host_indices) == len(cuda_indices)
-        if len(host_indices) == 0:
-            return
-        if len(host_indices) == 1:
-            yield host_indices, cuda_indices
-            return
-
-        order = torch.argsort(host_indices)
-        host_sorted = host_indices[order]
-        cuda_sorted = cuda_indices[order]
-        split_points = (
-            (host_sorted[1:] != host_sorted[:-1] + 1)
-            | (cuda_sorted[1:] != cuda_sorted[:-1] + 1)
-        ).nonzero(as_tuple=False)
-        start = 0
-        for split in split_points.flatten():
-            end = int(split) + 1
-            yield host_sorted[start:end], cuda_sorted[start:end]
-            start = end
-        yield host_sorted[start:], cuda_sorted[start:]
 
     def _try_allocate_host(self, length: int) -> torch.Tensor | None:
         if length > len(self.free_slots):
