@@ -56,6 +56,7 @@ class Ack(NamedTuple):
 RING_SIZE = 3  # 3 is enough and safe
 WRITE_LENGTH_THRESHOLD = 64
 RESET_ACK_THRESHOLD = 512
+LOAD_PARALLEL_STREAMS = 4
 
 
 class HiCacheTransferMixin:
@@ -67,6 +68,7 @@ class HiCacheTransferMixin:
     ) -> None:
         self.load_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
+        self.load_parallel_streams = [torch.cuda.Stream() for _ in range(LOAD_PARALLEL_STREAMS)]
         self.load_stream_ctx = torch.cuda.stream(self.load_stream)
         self.write_stream_ctx = torch.cuda.stream(self.write_stream)
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
@@ -194,17 +196,26 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
         host_indices, cuda_indices = self._merge_transactions(self.load_queue)
         num_tokens = len(host_indices)
+        active_streams: List[torch.cuda.Stream] = []
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
-            self.load_stream.wait_stream(current_stream)
             if not self.use_layerwise:
-                for host_chunk, cuda_chunk in self._iter_contiguous_chunks(host_indices, cuda_indices):
-                    self.load_all(
-                        host_indices=host_chunk,
-                        cuda_indices=cuda_chunk,
-                    )
+                chunks = list(self._iter_contiguous_chunks(host_indices, cuda_indices))
+                active_streams = self.load_parallel_streams[: min(len(chunks), len(self.load_parallel_streams))]
+                for stream in active_streams:
+                    stream.wait_stream(current_stream)
+                for i, (host_chunk, cuda_chunk) in enumerate(chunks):
+                    stream = active_streams[i % len(active_streams)]
+                    with torch.cuda.stream(stream):
+                        self.load_all(
+                            host_indices=host_chunk,
+                            cuda_indices=cuda_chunk,
+                        )
+                for stream in active_streams:
+                    self.load_stream.wait_stream(stream)
             else:
+                self.load_stream.wait_stream(current_stream)
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
@@ -216,6 +227,10 @@ class HiCacheController(HiCacheTransferMixin):
                 current_stream.wait_event(finish_event)
 
         # NOTE: must record here to avoid use after free
+        if not self.use_layerwise:
+            for stream in active_streams:
+                host_indices.record_stream(stream)
+                cuda_indices.record_stream(stream)
         host_indices.record_stream(self.load_stream)
         cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
