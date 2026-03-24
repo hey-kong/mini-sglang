@@ -447,8 +447,8 @@ struct HiCacheKernel {
         .verify(indices_src)
         .verify(indices_dst);
 
-    RuntimeCheck(kv_src_stride_bytes >= bulk_bytes && kv_dst_stride_bytes >= bulk_bytes,
-                 "Hicache bulk: bulk_bytes must be <= token stride.");
+    RuntimeCheck(kv_src_stride_bytes > 0 && kv_dst_stride_bytes > 0 && bulk_bytes > 0,
+                 "Hicache bulk: stride and bulk_bytes must be positive.");
 
     const auto use_int32 = indices_dtype.unwrap().bits == 32;
     const auto device = indices_device.unwrap();
