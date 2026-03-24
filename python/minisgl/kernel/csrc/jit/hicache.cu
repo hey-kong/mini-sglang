@@ -222,7 +222,7 @@ hicache_transfer_all_layer(const __grid_constant__ HicacheKernelParams params) {
   }
 }
 
-template <typename T, int64_t _, uint32_t __, uint32_t kBlockQuota,
+template <typename T, int64_t kElementSizeUnused, uint32_t kUnrollUnused, uint32_t kBlockQuota,
           uint32_t kBlockSize>
 SGL_HICACHE_KERNEL void
 hicache_transfer_all_layer_bulk(const __grid_constant__ HicacheKernelParams params) {
@@ -232,7 +232,7 @@ hicache_transfer_all_layer_bulk(const __grid_constant__ HicacheKernelParams para
 
   const auto &[k_cache_dst, v_cache_dst, indices_dst, // dst
                k_cache_src, v_cache_src, indices_src, // src
-               kv_cache_src_stride, kv_cache_dst_stride, length, _, bulk_bytes] = params;
+               kv_cache_src_stride, kv_cache_dst_stride, length, num_layers_unused, bulk_bytes] = params;
   const auto num_blocks = min(gridDim.x, static_cast<uint32_t>(kBlockQuota));
   for (uint32_t i = blockIdx.x; i < length; i += num_blocks) {
     const auto pos_src = static_cast<const T *>(indices_src)[i];
