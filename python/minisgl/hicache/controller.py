@@ -141,6 +141,9 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
+        self.enable_page_first_bulk_load = (
+            config.device_mem_layout == "page_first" and config.host_mem_layout == "page_first"
+        )
         self.page_size = config.page_size
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
@@ -201,19 +204,25 @@ class HiCacheController(HiCacheTransferMixin):
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             if not self.use_layerwise:
-                chunks = list(self._iter_contiguous_chunks(host_indices, cuda_indices))
-                active_streams = self.load_parallel_streams[: min(len(chunks), len(self.load_parallel_streams))]
-                for stream in active_streams:
-                    stream.wait_stream(current_stream)
-                for i, (host_chunk, cuda_chunk) in enumerate(chunks):
-                    stream = active_streams[i % len(active_streams)]
-                    with torch.cuda.stream(stream):
-                        self.load_all(
-                            host_indices=host_chunk,
-                            cuda_indices=cuda_chunk,
-                        )
-                for stream in active_streams:
-                    self.load_stream.wait_stream(stream)
+                if self.enable_page_first_bulk_load:
+                    self.load_stream.wait_stream(current_stream)
+                    self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
+                else:
+                    chunks = list(self._iter_contiguous_chunks(host_indices, cuda_indices))
+                    active_streams = self.load_parallel_streams[
+                        : min(len(chunks), len(self.load_parallel_streams))
+                    ]
+                    for stream in active_streams:
+                        stream.wait_stream(current_stream)
+                    for i, (host_chunk, cuda_chunk) in enumerate(chunks):
+                        stream = active_streams[i % len(active_streams)]
+                        with torch.cuda.stream(stream):
+                            self.load_all(
+                                host_indices=host_chunk,
+                                cuda_indices=cuda_chunk,
+                            )
+                    for stream in active_streams:
+                        self.load_stream.wait_stream(stream)
             else:
                 self.load_stream.wait_stream(current_stream)
                 for i in range(self.num_layers):
