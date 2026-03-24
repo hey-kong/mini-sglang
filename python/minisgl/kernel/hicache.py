@@ -27,6 +27,7 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         cuda_wrappers=[
             ("launch_one", f"&HiCacheKernel<{args}>::run_one"),
             ("launch_all", f"&HiCacheKernel<{args}>::run_all"),
+            ("launch_bulk", f"&HiCacheKernel<{args}>::run_bulk"),
         ],
     )
 
@@ -146,6 +147,42 @@ def transfer_hicache_all_layer(
         indices_src,
         kv_cache_src_stride_bytes,
         kv_cache_dst_stride_bytes,
+    )
+
+
+def transfer_hicache_all_layer_bulk(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    *,
+    kv_cache_src_stride_bytes: int,
+    kv_cache_dst_stride_bytes: int,
+    bulk_bytes: int,
+    element_size: int | None = None,
+    unroll: int | None = None,  # can be tuned for performance
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> None:
+    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    element_size = element_size or bulk_bytes
+    unroll = unroll or _default_unroll(element_size)
+    module = _jit_hicache_module(
+        element_size=element_size,
+        unroll=unroll,
+        block_quota=block_quota,
+    )
+    module.launch_bulk(
+        k_cache_dst,
+        v_cache_dst,
+        indices_dst,
+        k_cache_src,
+        v_cache_src,
+        indices_src,
+        kv_cache_src_stride_bytes,
+        kv_cache_dst_stride_bytes,
+        bulk_bytes,
     )
 
 

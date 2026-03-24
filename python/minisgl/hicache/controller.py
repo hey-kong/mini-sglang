@@ -114,6 +114,24 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
+    def load_all_bulk(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        from minisgl.kernel import transfer_hicache_all_layer_bulk
+
+        bulk_bytes = self._host_stride_bytes
+        assert self._host_stride_bytes == self._cuda_stride_bytes
+        transfer_hicache_all_layer_bulk(
+            k_cache_dst=self._cuda_kv[0][0],
+            v_cache_dst=self._cuda_kv[1][0],
+            indices_dst=cuda_indices,
+            k_cache_src=self._host_kv[0][0],
+            v_cache_src=self._host_kv[1][0],
+            indices_src=host_indices,
+            kv_cache_dst_stride_bytes=self._cuda_stride_bytes,
+            kv_cache_src_stride_bytes=self._host_stride_bytes,
+            bulk_bytes=bulk_bytes,
+            element_size=self._element_bytes,
+        )
+
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_layer
 
@@ -206,7 +224,7 @@ class HiCacheController(HiCacheTransferMixin):
             if not self.use_layerwise:
                 if self.enable_page_first_bulk_load:
                     self.load_stream.wait_stream(current_stream)
-                    self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
+                    self.load_all_bulk(host_indices=host_indices, cuda_indices=cuda_indices)
                 else:
                     chunks = list(self._iter_contiguous_chunks(host_indices, cuda_indices))
                     active_streams = self.load_parallel_streams[
