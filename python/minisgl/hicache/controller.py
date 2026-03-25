@@ -68,12 +68,10 @@ class HiCacheTransferMixin:
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
-        self._cuda_storage = cuda_kv
-        self._host_storage = host_kv
         # page-major views: [num_pages, page_size, num_layers, num_kv_heads, head_dim]
         # when backing storage is page_first, one page slice is physically contiguous.
-        self._cuda_page_storage = [t.permute(1, 2, 0, 3, 4) for t in self._cuda_storage]
-        self._host_page_storage = [t.permute(1, 2, 0, 3, 4) for t in self._host_storage]
+        self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
+        self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
         del cuda_kv, host_kv  # free original references to avoid confusion
@@ -138,10 +136,10 @@ class HiCacheTransferMixin:
             host_page = int(host_indices[offset].item()) // self.page_size
             cuda_page = int(cuda_indices[offset].item()) // self.page_size
             hicache_transfer_one_page(
-                k_cache_dst=self._cuda_page_storage[0],
-                v_cache_dst=self._cuda_page_storage[1],
-                k_cache_src=self._host_page_storage[0],
-                v_cache_src=self._host_page_storage[1],
+                k_cache_dst=self._cuda_page[0],
+                v_cache_dst=self._cuda_page[1],
+                k_cache_src=self._host_page[0],
+                v_cache_src=self._host_page[1],
                 host_page=host_page,
                 cuda_page=cuda_page,
             )
@@ -184,10 +182,10 @@ class HiCacheController(HiCacheTransferMixin):
             config=config,
         )
         if self.use_pagewise_bulk_load:
-            assert self._cuda_page_storage[0].is_contiguous()
-            assert self._cuda_page_storage[1].is_contiguous()
-            assert self._host_page_storage[0].is_contiguous()
-            assert self._host_page_storage[1].is_contiguous()
+            assert self._cuda_page[0].is_contiguous()
+            assert self._cuda_page[1].is_contiguous()
+            assert self._host_page[0].is_contiguous()
+            assert self._host_page[1].is_contiguous()
 
     def prepare_load(
         self,
