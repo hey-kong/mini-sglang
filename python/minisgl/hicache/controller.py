@@ -123,17 +123,24 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
-    def hicache_transfer_one_page(self, host_page: int, cuda_page: int) -> None:
+    def hicache_transfer_one_page(
+        self, host_indices: torch.Tensor, cuda_indices: torch.Tensor
+    ) -> None:
         from minisgl.kernel import hicache_transfer_one_page
 
-        hicache_transfer_one_page(
-            k_cache_dst=self._cuda_storage[0],
-            v_cache_dst=self._cuda_storage[1],
-            k_cache_src=self._host_storage[0],
-            v_cache_src=self._host_storage[1],
-            host_page=host_page,
-            cuda_page=cuda_page,
-        )
+        assert len(host_indices) == len(cuda_indices)
+        assert len(host_indices) % self.page_size == 0
+        for offset in range(0, len(host_indices), self.page_size):
+            host_page = int(host_indices[offset].item()) // self.page_size
+            cuda_page = int(cuda_indices[offset].item()) // self.page_size
+            hicache_transfer_one_page(
+                k_cache_dst=self._cuda_storage[0],
+                v_cache_dst=self._cuda_storage[1],
+                k_cache_src=self._host_storage[0],
+                v_cache_src=self._host_storage[1],
+                host_page=host_page,
+                cuda_page=cuda_page,
+            )
 
 
 class HiCacheController(HiCacheTransferMixin):
@@ -218,12 +225,7 @@ class HiCacheController(HiCacheTransferMixin):
             if self.use_pagewise_bulk_load:
                 for _, host_values, cuda_values in self.load_queue:
                     for host_value, cuda_value in zip(host_values, cuda_values):
-                        assert len(host_value) == len(cuda_value)
-                        assert len(host_value) % self.page_size == 0
-                        for offset in range(0, len(host_value), self.page_size):
-                            host_page = int(host_value[offset].item()) // self.page_size
-                            cuda_page = int(cuda_value[offset].item()) // self.page_size
-                            self.hicache_transfer_one_page(host_page, cuda_page)
+                        self.hicache_transfer_one_page(host_value, cuda_value)
             elif not self.use_layerwise:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
