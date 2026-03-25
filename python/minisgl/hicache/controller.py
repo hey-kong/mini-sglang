@@ -226,9 +226,10 @@ class HiCacheController(HiCacheTransferMixin):
                 for _, host_values, cuda_values in self.load_queue:
                     for host_value, cuda_value in zip(host_values, cuda_values):
                         assert len(host_value) == len(cuda_value)
-                        assert len(host_value) == self.page_size
-                        host_pages.append(int(host_value[0].item()))
-                        cuda_pages.append(int(cuda_value[0].item()))
+                        assert len(host_value) % self.page_size == 0
+                        for offset in range(0, len(host_value), self.page_size):
+                            host_pages.append(int(host_value[offset].item()) // self.page_size)
+                            cuda_pages.append(int(cuda_value[offset].item()) // self.page_size)
                 if host_pages:
                     host_pages = torch.tensor(host_pages, dtype=torch.int64, device="cpu")
                     cuda_pages = torch.tensor(cuda_pages, dtype=torch.int64, device=self.device)
