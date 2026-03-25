@@ -155,6 +155,8 @@ def transfer_hicache_all_page(
     cache_src: tuple[torch.Tensor, torch.Tensor],
     page_ids_src: torch.Tensor,
 ) -> None:
+    import torch
+
     k_dst, v_dst = cache_dst
     k_src, v_src = cache_src
     idx_dst = page_ids_dst.to(device=k_dst.device, dtype=torch.int64, non_blocking=True)
