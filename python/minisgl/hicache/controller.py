@@ -144,10 +144,8 @@ class HiCacheTransferMixin:
         host_page = int(host_indices[0].item()) // self.page_size
         cuda_page = int(cuda_indices[0].item()) // self.page_size
         hicache_transfer_one_page(
-            k_cache_dst=self._cuda_page[0],
-            v_cache_dst=self._cuda_page[1],
-            k_cache_src=self._host_page[0],
-            v_cache_src=self._host_page[1],
+            cache_dst=(self._cuda_page[0], self._cuda_page[1]),
+            cache_src=(self._host_page[0], self._host_page[1]),
             host_page=host_page,
             cuda_page=cuda_page,
         )
