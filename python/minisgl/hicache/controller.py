@@ -125,15 +125,15 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
-    def hicache_transfer_one_page(
-        self, host_indices: torch.Tensor, cuda_indices: torch.Tensor
-    ) -> None:
-        assert len(host_indices) == len(cuda_indices)
-        assert len(host_indices) == self.page_size
-        host_page = int(host_indices[0].item())
-        cuda_page = int(cuda_indices[0].item())
-        self._cuda_page[0][cuda_page].copy_(self._host_page[0][host_page], non_blocking=True)
-        self._cuda_page[1][cuda_page].copy_(self._host_page[1][host_page], non_blocking=True)
+    def hicache_transfer_pages(self, host_pages: torch.Tensor, cuda_pages: torch.Tensor) -> None:
+        from minisgl.kernel import transfer_hicache_page_chunk
+
+        transfer_hicache_page_chunk(
+            cache_dst=(self._cuda_page[0], self._cuda_page[1]),
+            page_ids_dst=cuda_pages,
+            cache_src=(self._host_page[0], self._host_page[1]),
+            page_ids_src=host_pages,
+        )
 
 
 class HiCacheController(HiCacheTransferMixin):
@@ -221,9 +221,18 @@ class HiCacheController(HiCacheTransferMixin):
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if self.use_pagewise_bulk_load:
+                host_pages: List[int] = []
+                cuda_pages: List[int] = []
                 for _, host_values, cuda_values in self.load_queue:
                     for host_value, cuda_value in zip(host_values, cuda_values):
-                        self.hicache_transfer_one_page(host_value, cuda_value)
+                        assert len(host_value) == len(cuda_value)
+                        assert len(host_value) == self.page_size
+                        host_pages.append(int(host_value[0].item()))
+                        cuda_pages.append(int(cuda_value[0].item()))
+                if host_pages:
+                    host_pages = torch.tensor(host_pages, dtype=torch.int64, device="cpu")
+                    cuda_pages = torch.tensor(cuda_pages, dtype=torch.int64, device=self.device)
+                    self.hicache_transfer_pages(host_pages, cuda_pages)
             elif not self.use_layerwise:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
