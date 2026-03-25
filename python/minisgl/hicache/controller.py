@@ -126,9 +126,9 @@ class HiCacheTransferMixin:
         )
 
     def hicache_transfer_pages(self, host_pages: torch.Tensor, cuda_pages: torch.Tensor) -> None:
-        from minisgl.kernel import transfer_hicache_page_chunk
+        from minisgl.kernel import transfer_hicache_all_page
 
-        transfer_hicache_page_chunk(
+        transfer_hicache_all_page(
             cache_dst=(self._cuda_page[0], self._cuda_page[1]),
             page_ids_dst=cuda_pages,
             cache_src=(self._host_page[0], self._host_page[1]),

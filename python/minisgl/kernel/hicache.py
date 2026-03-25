@@ -149,7 +149,7 @@ def transfer_hicache_all_layer(
     )
 
 
-def transfer_hicache_page_chunk(
+def transfer_hicache_all_page(
     cache_dst: tuple[torch.Tensor, torch.Tensor],
     page_ids_dst: torch.Tensor,
     cache_src: tuple[torch.Tensor, torch.Tensor],
