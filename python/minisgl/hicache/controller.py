@@ -67,11 +67,19 @@ class HiCacheTransferMixin:
         self.device = cuda_kv[0].device
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
+        self._enable_pagewise_bulk_load = (
+            config.device_mem_layout == "page_first"
+            and config.host_mem_layout == "page_first"
+            and not config.use_layerwise
+        )
+        self._cuda_page: List[torch.Tensor] | None = None
+        self._host_page: List[torch.Tensor] | None = None
+        if self._enable_pagewise_bulk_load:
+            # page-major views: [num_pages, page_size, num_layers, num_kv_heads, head_dim]
+            # when backing storage is page_first, one page slice is physically contiguous.
+            self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
+            self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
-        # page-major views: [num_pages, page_size, num_layers, num_kv_heads, head_dim]
-        # when backing storage is page_first, one page slice is physically contiguous.
-        self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
-        self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
         del cuda_kv, host_kv  # free original references to avoid confusion
@@ -132,6 +140,7 @@ class HiCacheTransferMixin:
 
         assert len(host_indices) == len(cuda_indices)
         assert len(host_indices) % self.page_size == 0
+        assert self._cuda_page is not None and self._host_page is not None
         for offset in range(0, len(host_indices), self.page_size):
             host_page = int(host_indices[offset].item()) // self.page_size
             cuda_page = int(cuda_indices[offset].item()) // self.page_size
@@ -182,6 +191,7 @@ class HiCacheController(HiCacheTransferMixin):
             config=config,
         )
         if self.use_pagewise_bulk_load:
+            assert self._cuda_page is not None and self._host_page is not None
             assert self._cuda_page[0].is_contiguous()
             assert self._cuda_page[1].is_contiguous()
             assert self._host_page[0].is_contiguous()
