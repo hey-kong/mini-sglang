@@ -161,8 +161,10 @@ def transfer_hicache_all_page(
     k_src, v_src = cache_src
     idx_dst = page_ids_dst.to(device=k_dst.device, dtype=torch.int64, non_blocking=True)
     idx_src = page_ids_src.to(device=k_src.device, dtype=torch.int64, non_blocking=True)
-    k_dst.index_copy_(0, idx_dst, k_src.index_select(0, idx_src))
-    v_dst.index_copy_(0, idx_dst, v_src.index_select(0, idx_src))
+    k_chunk = k_src.index_select(0, idx_src).to(device=k_dst.device, non_blocking=True)
+    v_chunk = v_src.index_select(0, idx_src).to(device=v_dst.device, non_blocking=True)
+    k_dst.index_copy_(0, idx_dst, k_chunk)
+    v_dst.index_copy_(0, idx_dst, v_chunk)
 
 
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
