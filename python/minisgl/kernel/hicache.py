@@ -149,6 +149,19 @@ def transfer_hicache_all_layer(
     )
 
 
+def hicache_transfer_one_page(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    *,
+    host_page: int,
+    cuda_page: int,
+) -> None:
+    k_cache_dst[:, cuda_page].copy_(k_cache_src[:, host_page], non_blocking=True)
+    v_cache_dst[:, cuda_page].copy_(v_cache_src[:, host_page], non_blocking=True)
+
+
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
     import torch
 

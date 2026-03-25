@@ -68,6 +68,8 @@ class HiCacheTransferMixin:
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
+        self._cuda_storage = cuda_kv
+        self._host_storage = host_kv
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
         del cuda_kv, host_kv  # free original references to avoid confusion
@@ -121,6 +123,18 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
+    def hicache_transfer_one_page(self, host_page: int, cuda_page: int) -> None:
+        from minisgl.kernel import hicache_transfer_one_page
+
+        hicache_transfer_one_page(
+            k_cache_dst=self._cuda_storage[0],
+            v_cache_dst=self._cuda_storage[1],
+            k_cache_src=self._host_storage[0],
+            v_cache_src=self._host_storage[1],
+            host_page=host_page,
+            cuda_page=cuda_page,
+        )
+
 
 class HiCacheController(HiCacheTransferMixin):
     def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
@@ -134,6 +148,11 @@ class HiCacheController(HiCacheTransferMixin):
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
         self.page_size = config.page_size
+        self.use_pagewise_bulk_load = (
+            config.device_mem_layout == "page_first"
+            and config.host_mem_layout == "page_first"
+            and not self.use_layerwise
+        )
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
@@ -184,16 +203,31 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
-        host_indices, cuda_indices = self._merge_transactions(self.load_queue)
-        num_tokens = len(host_indices)
+        host_indices: torch.Tensor | None = None
+        cuda_indices: torch.Tensor | None = None
+        if not self.use_pagewise_bulk_load:
+            host_indices, cuda_indices = self._merge_transactions(self.load_queue)
+            num_tokens = len(host_indices)
+        else:
+            num_tokens = sum(len(tx.host_list[i]) for tx in self.load_queue for i in range(len(tx.host_list)))
         current_stream = torch.cuda.current_stream()
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
-            if not self.use_layerwise:
+            if self.use_pagewise_bulk_load:
+                for _, host_values, cuda_values in self.load_queue:
+                    for host_value, cuda_value in zip(host_values, cuda_values):
+                        assert len(host_value) == len(cuda_value)
+                        assert len(host_value) % self.page_size == 0
+                        for offset in range(0, len(host_value), self.page_size):
+                            host_page = int(host_value[offset].item()) // self.page_size
+                            cuda_page = int(cuda_value[offset].item()) // self.page_size
+                            self.hicache_transfer_one_page(host_page, cuda_page)
+            elif not self.use_layerwise:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 for i in range(self.num_layers):
+                    assert host_indices is not None and cuda_indices is not None
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
             finish_event = counter.events[-1]
@@ -204,8 +238,9 @@ class HiCacheController(HiCacheTransferMixin):
                 current_stream.wait_event(finish_event)
 
         # NOTE: must record here to avoid use after free
-        host_indices.record_stream(self.load_stream)
-        cuda_indices.record_stream(self.load_stream)
+        if host_indices is not None and cuda_indices is not None:
+            host_indices.record_stream(self.load_stream)
+            cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
         self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, finish_event))
