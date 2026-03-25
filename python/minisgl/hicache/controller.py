@@ -139,19 +139,18 @@ class HiCacheTransferMixin:
         from minisgl.kernel import hicache_transfer_one_page
 
         assert len(host_indices) == len(cuda_indices)
-        assert len(host_indices) % self.page_size == 0
+        assert len(host_indices) == self.page_size
         assert self._cuda_page is not None and self._host_page is not None
-        for offset in range(0, len(host_indices), self.page_size):
-            host_page = int(host_indices[offset].item()) // self.page_size
-            cuda_page = int(cuda_indices[offset].item()) // self.page_size
-            hicache_transfer_one_page(
-                k_cache_dst=self._cuda_page[0],
-                v_cache_dst=self._cuda_page[1],
-                k_cache_src=self._host_page[0],
-                v_cache_src=self._host_page[1],
-                host_page=host_page,
-                cuda_page=cuda_page,
-            )
+        host_page = int(host_indices[0].item()) // self.page_size
+        cuda_page = int(cuda_indices[0].item()) // self.page_size
+        hicache_transfer_one_page(
+            k_cache_dst=self._cuda_page[0],
+            v_cache_dst=self._cuda_page[1],
+            k_cache_src=self._host_page[0],
+            v_cache_src=self._host_page[1],
+            host_page=host_page,
+            cuda_page=cuda_page,
+        )
 
 
 class HiCacheController(HiCacheTransferMixin):
