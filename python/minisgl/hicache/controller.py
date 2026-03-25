@@ -67,8 +67,6 @@ class HiCacheTransferMixin:
         self.device = cuda_kv[0].device
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
-        self._cuda_storage = cuda_kv
-        self._host_storage = host_kv
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
@@ -128,14 +126,17 @@ class HiCacheTransferMixin:
     ) -> None:
         assert len(host_indices) == len(cuda_indices)
         assert len(host_indices) == self.page_size
-        host_page = int(host_indices[0].item()) // self.page_size
-        cuda_page = int(cuda_indices[0].item()) // self.page_size
-        self._cuda_storage[0][:, cuda_page].copy_(
-            self._host_storage[0][:, host_page], non_blocking=True
-        )
-        self._cuda_storage[1][:, cuda_page].copy_(
-            self._host_storage[1][:, host_page], non_blocking=True
-        )
+        host_start = int(host_indices[0].item())
+        cuda_start = int(cuda_indices[0].item())
+        host_end = host_start + self.page_size
+        cuda_end = cuda_start + self.page_size
+        for i in range(self.num_layers):
+            self._cuda_kv[0][i][cuda_start:cuda_end].copy_(
+                self._host_kv[0][i][host_start:host_end], non_blocking=True
+            )
+            self._cuda_kv[1][i][cuda_start:cuda_end].copy_(
+                self._host_kv[1][i][host_start:host_end], non_blocking=True
+            )
 
 
 class HiCacheController(HiCacheTransferMixin):
