@@ -191,11 +191,7 @@ class HiCacheController(HiCacheTransferMixin):
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if not self.use_layerwise:
-                for i in range(0, num_tokens, self.page_size):
-                    self.load_all(
-                        host_indices=host_indices[i : i + self.page_size],
-                        cuda_indices=cuda_indices[i : i + self.page_size],
-                    )
+                self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
