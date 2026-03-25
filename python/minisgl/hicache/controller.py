@@ -130,8 +130,8 @@ class HiCacheTransferMixin:
     ) -> None:
         assert len(host_indices) == len(cuda_indices)
         assert len(host_indices) == self.page_size
-        host_page = int(host_indices[0].item()) // self.page_size
-        cuda_page = int(cuda_indices[0].item()) // self.page_size
+        host_page = int(host_indices[0].item())
+        cuda_page = int(cuda_indices[0].item())
         self._cuda_page[0][cuda_page].copy_(self._host_page[0][host_page], non_blocking=True)
         self._cuda_page[1][cuda_page].copy_(self._host_page[1][host_page], non_blocking=True)
 
