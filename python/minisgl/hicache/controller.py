@@ -135,23 +135,26 @@ class HiCacheTransferMixin:
         assert len(host_indices) % self.page_size == 0, \
             "page-wise load requires page-aligned length"
 
-        num_pages = len(host_indices) // self.page_size
+        page_offsets = torch.arange(
+            0,
+            len(host_indices),
+            self.page_size,
+            device=host_indices.device,
+            dtype=torch.int64,
+        )
+        host_pages = (host_indices.index_select(0, page_offsets) // self.page_size).to(torch.int64)
+        cuda_pages = (cuda_indices.index_select(0, page_offsets) // self.page_size).to(torch.int64)
 
-        for i in range(num_pages):
-            host_start = int(host_indices[i * self.page_size].item())
-            cuda_start = int(cuda_indices[i * self.page_size].item())
-
-            host_page = host_start // self.page_size
-            cuda_page = cuda_start // self.page_size
-
-            self._cuda_page[0][cuda_page].copy_(
-                self._host_page[0][host_page],
-                non_blocking=True,
-            )
-            self._cuda_page[1][cuda_page].copy_(
-                self._host_page[1][host_page],
-                non_blocking=True,
-            )
+        self._cuda_page[0].index_copy_(
+            0,
+            cuda_pages,
+            self._host_page[0].index_select(0, host_pages),
+        )
+        self._cuda_page[1].index_copy_(
+            0,
+            cuda_pages,
+            self._host_page[1].index_select(0, host_pages),
+        )
 
 
 class HiCacheController(HiCacheTransferMixin):
