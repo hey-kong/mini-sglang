@@ -187,11 +187,6 @@ def transfer_hicache_one_page(
     )
 
 
-def transfer_hicache_all_page(*args, **kwargs) -> None:
-    # Backward-compatible alias.
-    transfer_hicache_one_page(*args, **kwargs)
-
-
 def allocate_host(*shape: int, dtype: torch.dtype) -> torch.Tensor:
     import torch
 
