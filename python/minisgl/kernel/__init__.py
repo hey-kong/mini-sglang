@@ -24,5 +24,4 @@ __all__ = [
     "transfer_hicache_one_layer",
     "transfer_hicache_all_layer",
     "transfer_hicache_one_page",
-    "transfer_hicache_all_page",
 ]
