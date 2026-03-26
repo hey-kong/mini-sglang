@@ -243,7 +243,9 @@ class HiCacheController(HiCacheTransferMixin):
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
             if self.pagewise_load:
-                self.load_pages(host_indices=host_indices, cuda_indices=cuda_indices)
+                # NOTE: keep one-kernel bulk transfer here. The Python-side page run
+                # coalescing path can become a bottleneck and regress host->HBM BW.
+                self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             elif self.use_layerwise:
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
