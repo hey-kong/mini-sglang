@@ -416,12 +416,23 @@ struct HiCacheKernel {
                        const int64_t kv_dst_stride_bytes) {
     using namespace host;
 
+    auto A = SymbolicSize{};
+    auto B = SymbolicSize{};
+    auto C = SymbolicSize{};
+    auto D = SymbolicSize{};
+    auto E = SymbolicSize{};
+    auto SA = SymbolicSize{};
+    auto SB = SymbolicSize{};
+    auto SC = SymbolicSize{};
+    auto SD = SymbolicSize{};
+    auto SE = SymbolicSize{};
     auto L = SymbolicSize{"indices length"};
     auto cache_dtype = SymbolicDType{};
     auto indices_dtype = SymbolicDType{};
     auto indices_device = SymbolicDevice{};
 
-    TensorMatcher({-1, -1, -1, -1, -1}) //
+    TensorMatcher({A, B, C, D, E}) //
+        .with_strides({SA, SB, SC, SD, SE})
         .with_dtype(cache_dtype)
         .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
         .verify(k_cache_src)

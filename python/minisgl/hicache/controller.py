@@ -79,6 +79,9 @@ class HiCacheTransferMixin:
         self._element_bytes = self._cuda_kv[0][0].shape[-1] * item_bytes
         self._cuda_page_stride_bytes = self._cuda_k_full.stride(1) * item_bytes
         self._host_page_stride_bytes = self._host_k_full.stride(1) * item_bytes
+        assert self._cuda_page_stride_bytes == self._cuda_v_full.stride(1) * item_bytes
+        assert self._host_page_stride_bytes == self._host_v_full.stride(1) * item_bytes
+        assert self._cuda_page_stride_bytes == self._host_page_stride_bytes
         self._cuda_k_ptrs = _make_ptrs(self._cuda_kv[0], self.device)
         self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
@@ -134,10 +137,10 @@ class HiCacheTransferMixin:
         host_pages = host_indices.view(-1, self.page_size)
         cuda_pages = cuda_indices.view(-1, self.page_size)
 
-        expected = torch.arange(self.page_size, device=host_indices.device)
-        host_is_page_aligned = bool((host_pages % self.page_size == expected).all().item())
-        cuda_is_page_aligned = bool((cuda_pages % self.page_size == expected).all().item())
-        assert host_is_page_aligned and cuda_is_page_aligned
+        host_offsets = host_pages % self.page_size
+        cuda_offsets = cuda_pages % self.page_size
+        # page 级搬运只关心 page id，要求每个 page chunk 在 src/dst 中有一致的页内偏移。
+        assert bool((host_offsets == cuda_offsets).all().item())
 
         transfer_hicache_all_page(
             k_cache_dst=self._cuda_k_full,
@@ -148,7 +151,7 @@ class HiCacheTransferMixin:
             indices_src=(host_pages[:, 0] // self.page_size).contiguous(),
             kv_cache_dst_stride_bytes=self._cuda_page_stride_bytes,
             kv_cache_src_stride_bytes=self._host_page_stride_bytes,
-            element_size=self._cuda_page_stride_bytes,
+            element_size=self._host_page_stride_bytes,
         )
 
 
