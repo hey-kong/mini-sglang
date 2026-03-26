@@ -148,7 +148,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
         self.page_size = config.page_size
-        self.pagewise_bulk_load = (
+        self.pagewise_load = (
             config.device_mem_layout == "page_first"
             and config.host_mem_layout == "page_first"
             and not self.use_layerwise
@@ -172,7 +172,7 @@ class HiCacheController(HiCacheTransferMixin):
             host_kv=list(self.host_pool.get_kv_storage()),
             config=config,
         )
-        if self.pagewise_bulk_load:
+        if self.pagewise_load:
             assert self._cuda_page[0].is_contiguous()
             assert self._cuda_page[1].is_contiguous()
             assert self._host_page[0].is_contiguous()
@@ -211,7 +211,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool.set_hicache_counter(counter if self.use_layerwise else None)
         host_indices: torch.Tensor | None = None
         cuda_indices: torch.Tensor | None = None
-        if not self.pagewise_bulk_load:
+        if not self.pagewise_load:
             host_indices, cuda_indices = self._merge_transactions(self.load_queue)
             num_tokens = len(host_indices)
         else:
@@ -220,15 +220,14 @@ class HiCacheController(HiCacheTransferMixin):
         counter.start_event.record(self.load_stream)
         with self.load_stream_ctx:
             self.load_stream.wait_stream(current_stream)
-            if self.pagewise_bulk_load:
+            if self.pagewise_load:
                 for _, host_values, cuda_values in self.load_queue:
                     for host_value, cuda_value in zip(host_values, cuda_values):
                         assert len(host_value) == len(cuda_value)
-                        assert len(host_value) % self.page_size == 0
-                        for offset in range(0, len(host_value), self.page_size):
-                            host_page = int(host_value[offset].item()) // self.page_size
-                            cuda_page = int(cuda_value[offset].item()) // self.page_size
-                            self.hicache_transfer_one_page(host_page, cuda_page)
+                        assert len(host_value) == self.page_size
+                        host_page = int(host_value[0].item()) // self.page_size
+                        cuda_page = int(cuda_value[0].item()) // self.page_size
+                        self.hicache_transfer_one_page(host_page, cuda_page)
             elif not self.use_layerwise:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
