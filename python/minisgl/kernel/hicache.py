@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import functools
+import torch
 from typing import TYPE_CHECKING
 
 from .utils import load_aot, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 DEFAULT_BLOCK_QUOTA = 2
