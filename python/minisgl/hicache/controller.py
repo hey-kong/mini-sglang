@@ -67,6 +67,8 @@ class HiCacheTransferMixin:
         self.device = cuda_kv[0].device
         self.page_size = config.page_size
         item_bytes = cuda_kv[0].element_size()
+        self._cuda_k_full, self._cuda_v_full = cuda_kv
+        self._host_k_full, self._host_v_full = host_kv
         storage_shape = (-1, num_kv_heads * head_dim)
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
@@ -75,6 +77,8 @@ class HiCacheTransferMixin:
         self._cuda_stride_bytes = self._cuda_kv[0][0].stride(0) * item_bytes
         self._host_stride_bytes = self._host_kv[0][0].stride(0) * item_bytes
         self._element_bytes = self._cuda_kv[0][0].shape[-1] * item_bytes
+        self._cuda_page_stride_bytes = self._cuda_k_full.stride(1) * item_bytes
+        self._host_page_stride_bytes = self._host_k_full.stride(1) * item_bytes
         self._cuda_k_ptrs = _make_ptrs(self._cuda_kv[0], self.device)
         self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
         self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
@@ -125,7 +129,27 @@ class HiCacheTransferMixin:
     def load_all_page(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_page
 
-        # TODO: achieve transfer_hicache_all_page and invoke
+        assert host_indices.numel() == cuda_indices.numel()
+        assert host_indices.numel() % self.page_size == 0
+        host_pages = host_indices.view(-1, self.page_size)
+        cuda_pages = cuda_indices.view(-1, self.page_size)
+
+        expected = torch.arange(self.page_size, device=host_indices.device)
+        host_is_page_aligned = bool((host_pages % self.page_size == expected).all().item())
+        cuda_is_page_aligned = bool((cuda_pages % self.page_size == expected).all().item())
+        assert host_is_page_aligned and cuda_is_page_aligned
+
+        transfer_hicache_all_page(
+            k_cache_dst=self._cuda_k_full,
+            v_cache_dst=self._cuda_v_full,
+            indices_dst=(cuda_pages[:, 0] // self.page_size).contiguous(),
+            k_cache_src=self._host_k_full,
+            v_cache_src=self._host_v_full,
+            indices_src=(host_pages[:, 0] // self.page_size).contiguous(),
+            kv_cache_dst_stride_bytes=self._cuda_page_stride_bytes,
+            kv_cache_src_stride_bytes=self._host_page_stride_bytes,
+            element_size=self._cuda_page_stride_bytes,
+        )
 
 
 class HiCacheController(HiCacheTransferMixin):
