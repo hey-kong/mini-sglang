@@ -221,6 +221,51 @@ hicache_transfer_all_layer(const __grid_constant__ HicacheKernelParams params) {
   }
 }
 
+template <typename T, int64_t kElementSize, uint32_t kUnroll,
+          uint32_t kBlockQuota, uint32_t kBlockSize>
+SGL_HICACHE_KERNEL void
+hicache_transfer_all_page(const __grid_constant__ HicacheKernelParams params) {
+  using namespace device;
+  using src_ptr_t = const void *;
+  using dst_ptr_t = void *;
+
+  static_assert(kBlockSize % kWarpThreads == 0);
+  static_assert(kWarpThreads % kUnroll == 0);
+
+  constexpr uint32_t kNumThreads = kWarpThreads / kUnroll;
+  constexpr uint32_t kWorkersPerBlock = kBlockSize / kNumThreads;
+  constexpr uint32_t kNumWorkers = kWorkersPerBlock * kBlockQuota;
+
+  const auto &[k_ptr_dst, v_ptr_dst, indices_dst, // dst
+               k_ptr_src, v_ptr_src, indices_src, // src
+               kv_cache_src_stride, kv_cache_dst_stride, length,
+               _ // metadata
+  ] = params;
+
+  const auto k_cache_src = static_cast<const src_ptr_t *>(k_ptr_src)[0];
+  const auto v_cache_src = static_cast<const src_ptr_t *>(v_ptr_src)[0];
+  const auto k_cache_dst = static_cast<const dst_ptr_t *>(k_ptr_dst)[0];
+  const auto v_cache_dst = static_cast<const dst_ptr_t *>(v_ptr_dst)[0];
+
+  const uint32_t work_id =
+      blockIdx.x * kWorkersPerBlock + threadIdx.x / kNumThreads;
+
+  for (uint32_t i = work_id; i < length; i += kNumWorkers) {
+    const auto page_src = static_cast<const T *>(indices_src)[i];
+    const auto page_dst = static_cast<const T *>(indices_dst)[i];
+
+    const auto src_k = pointer::offset(k_cache_src, page_src * kv_cache_src_stride);
+    const auto dst_k = pointer::offset(k_cache_dst, page_dst * kv_cache_dst_stride);
+    const auto src_v = pointer::offset(v_cache_src, page_src * kv_cache_src_stride);
+    const auto dst_v = pointer::offset(v_cache_dst, page_dst * kv_cache_dst_stride);
+
+    const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
+    const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
+    store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+    store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
+  }
+}
+
 template <int64_t kElementSize, uint32_t kUnroll, uint32_t kBlockQuota,
           uint32_t kBlockSize>
 struct HiCacheKernel {
@@ -232,6 +277,10 @@ struct HiCacheKernel {
   static constexpr auto kernel_all =
       hicache_transfer_all_layer<T, kElementSize, kUnroll, kBlockQuota,
                                  kBlockSize>;
+  template <typename T>
+  static constexpr auto kernel_page =
+      hicache_transfer_all_page<T, kElementSize, kUnroll, kBlockQuota,
+                                kBlockSize>;
 
   static void run_one(const tvm::ffi::TensorView k_cache_dst,
                       const tvm::ffi::TensorView v_cache_dst,
@@ -362,6 +411,62 @@ struct HiCacheKernel {
         .num_layers = static_cast<uint32_t>(N.unwrap()),
     };
     const auto kernel = use_int32 ? kernel_all<int32_t> : kernel_all<int64_t>;
+    LaunchKernel(num_blocks, kBlockSize, device)(kernel, params);
+  }
+
+  static void run_page(const tvm::ffi::TensorView k_ptr_dst,
+                       const tvm::ffi::TensorView v_ptr_dst,
+                       const tvm::ffi::TensorView indices_dst,
+                       const tvm::ffi::TensorView k_ptr_src,
+                       const tvm::ffi::TensorView v_ptr_src,
+                       const tvm::ffi::TensorView indices_src,
+                       const int64_t kv_src_stride_bytes,
+                       const int64_t kv_dst_stride_bytes) {
+    using namespace host;
+
+    auto L = SymbolicSize{"indices length"};
+    auto dtype_ = SymbolicDType{};
+    auto device_ = SymbolicDevice{};
+
+    TensorMatcher({1}) //
+        .with_dtype<uint64_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(k_ptr_src)
+        .verify(v_ptr_src)
+        .verify(k_ptr_dst)
+        .verify(v_ptr_dst);
+    TensorMatcher({L}) //
+        .with_dtype<int32_t, int64_t>(dtype_)
+        .with_device<kDLCUDA>(device_)
+        .verify(indices_src)
+        .verify(indices_dst);
+
+    const auto k_cache_dst_ptr = k_ptr_dst.data_ptr();
+    const auto v_cache_dst_ptr = v_ptr_dst.data_ptr();
+    const auto k_cache_src_ptr = k_ptr_src.data_ptr();
+    const auto v_cache_src_ptr = v_ptr_src.data_ptr();
+    const auto indices_dst_ptr = indices_dst.data_ptr();
+    const auto indices_src_ptr = indices_src.data_ptr();
+    const auto length = static_cast<uint32_t>(L.unwrap());
+    const auto use_int32 = dtype_.unwrap().bits == 32;
+    const auto device = device_.unwrap();
+
+    constexpr auto kWorkersPerBlock =
+        kBlockSize / (device::kWarpThreads / kUnroll);
+    const auto num_blocks =
+        std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
+    const auto params = HicacheKernelParams{
+        .k_cache_dst = k_cache_dst_ptr,
+        .v_cache_dst = v_cache_dst_ptr,
+        .indices_dst = indices_dst_ptr,
+        .k_cache_src = k_cache_src_ptr,
+        .v_cache_src = v_cache_src_ptr,
+        .indices_src = indices_src_ptr,
+        .kv_cache_src_stride = kv_src_stride_bytes,
+        .kv_cache_dst_stride = kv_dst_stride_bytes,
+        .length = length,
+    };
+    const auto kernel = use_int32 ? kernel_page<int32_t> : kernel_page<int64_t>;
     LaunchKernel(num_blocks, kBlockSize, device)(kernel, params);
   }
 };

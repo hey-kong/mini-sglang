@@ -71,6 +71,12 @@ class HiCacheTransferMixin:
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
+        self._cuda_page_stride_bytes = cuda_kv[0].stride(1) * item_bytes
+        self._host_page_stride_bytes = host_kv[0].stride(1) * item_bytes
+        self._cuda_k_page_ptr = _make_ptr(cuda_kv[0], self.device)
+        self._cuda_v_page_ptr = _make_ptr(cuda_kv[1], self.device)
+        self._host_k_page_ptr = _make_ptr(host_kv[0], self.device)
+        self._host_v_page_ptr = _make_ptr(host_kv[1], self.device)
         del cuda_kv, host_kv  # free original references to avoid confusion
         self._cuda_stride_bytes = self._cuda_kv[0][0].stride(0) * item_bytes
         self._host_stride_bytes = self._host_kv[0][0].stride(0) * item_bytes
@@ -125,7 +131,17 @@ class HiCacheTransferMixin:
     def load_all_page(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_page
 
-        # TODO: achieve transfer_hicache_all_page and invoke
+        transfer_hicache_all_page(
+            k_ptr_dst=self._cuda_k_page_ptr,
+            v_ptr_dst=self._cuda_v_page_ptr,
+            indices_dst=cuda_indices,
+            k_ptr_src=self._host_k_page_ptr,
+            v_ptr_src=self._host_v_page_ptr,
+            indices_src=host_indices,
+            kv_cache_dst_stride_bytes=self._cuda_page_stride_bytes,
+            kv_cache_src_stride_bytes=self._host_page_stride_bytes,
+            element_size=self._host_page_stride_bytes,
+        )
 
 
 class HiCacheController(HiCacheTransferMixin):
@@ -314,6 +330,9 @@ class HiCacheController(HiCacheTransferMixin):
 # NOTE: skip the annoying type checking here...
 def _create_event(enable_timing: bool = False) -> torch.Event:
     return torch.cuda.Event(enable_timing=enable_timing)  # type: ignore
+
+def _make_ptr(t: torch.Tensor, device: torch.device):
+    return torch.tensor([t.data_ptr()], device=device, dtype=torch.uint64)
 
 def _make_ptrs(ts: List[torch.Tensor], device: torch.device):
     return torch.tensor([t.data_ptr() for t in ts], device=device, dtype=torch.uint64)
