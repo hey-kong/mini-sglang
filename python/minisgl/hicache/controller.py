@@ -65,12 +65,9 @@ class HiCacheTransferMixin:
         self.write_stream_ctx = torch.cuda.stream(self.write_stream)
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
         self.device = cuda_kv[0].device
+        self.page_size = config.page_size
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
-        # page-major views: [num_pages, page_size, num_layers, num_kv_heads, head_dim]
-        # one page slice is contiguous in page_first layout.
-        self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
-        self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
@@ -128,15 +125,7 @@ class HiCacheTransferMixin:
     def load_all_page(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_page
 
-        transfer_hicache_all_page(
-            k_cache_dst=self._cuda_page[0],
-            v_cache_dst=self._cuda_page[1],
-            indices_dst=cuda_indices,
-            k_cache_src=self._host_page[0],
-            v_cache_src=self._host_page[1],
-            indices_src=host_indices,
-            page_size=self.page_size,
-        )
+        # TODO: achieve transfer_hicache_all_page and invoke
 
 
 class HiCacheController(HiCacheTransferMixin):
@@ -155,7 +144,6 @@ class HiCacheController(HiCacheTransferMixin):
             and config.host_mem_layout == "page_first"
             and not self.use_layerwise
         )
-        self.page_size = config.page_size
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
@@ -175,11 +163,6 @@ class HiCacheController(HiCacheTransferMixin):
             host_kv=list(self.host_pool.get_kv_storage()),
             config=config,
         )
-        if self.pagewise_load:
-            assert self._cuda_page[0].is_contiguous()
-            assert self._cuda_page[1].is_contiguous()
-            assert self._host_page[0].is_contiguous()
-            assert self._host_page[1].is_contiguous()
 
     def prepare_load(
         self,
