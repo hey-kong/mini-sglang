@@ -135,26 +135,34 @@ class HiCacheTransferMixin:
         assert len(host_indices) % self.page_size == 0, \
             "page-wise load requires page-aligned length"
 
-        page_offsets = torch.arange(
-            0,
-            len(host_indices),
-            self.page_size,
-            device=host_indices.device,
-            dtype=torch.int64,
-        )
-        host_pages = (host_indices.index_select(0, page_offsets) // self.page_size).to(torch.int64)
-        cuda_pages = (cuda_indices.index_select(0, page_offsets) // self.page_size).to(torch.int64)
+        host_pages = torch.div(host_indices[:: self.page_size], self.page_size, rounding_mode="floor")
+        cuda_pages = torch.div(cuda_indices[:: self.page_size], self.page_size, rounding_mode="floor")
+        if len(host_pages) == 0:
+            return
 
-        self._cuda_page[0].index_copy_(
-            0,
-            cuda_pages,
-            self._host_page[0].index_select(0, host_pages),
-        )
-        self._cuda_page[1].index_copy_(
-            0,
-            cuda_pages,
-            self._host_page[1].index_select(0, host_pages),
-        )
+        # Merge adjacent page pairs into ranges so one copy_ call handles many pages.
+        if len(host_pages) == 1:
+            run_starts, run_ends = [0], [1]
+        else:
+            host_cont = host_pages[1:] == (host_pages[:-1] + 1)
+            cuda_cont = cuda_pages[1:] == (cuda_pages[:-1] + 1)
+            cut_points = torch.nonzero(~(host_cont & cuda_cont), as_tuple=False).flatten() + 1
+            run_starts = [0] + cut_points.cpu().tolist()
+            run_ends = run_starts[1:] + [len(host_pages)]
+
+        for start, end in zip(run_starts, run_ends):
+            n_pages = end - start
+            host_page_start = int(host_pages[start].item())
+            cuda_page_start = int(cuda_pages[start].item())
+
+            self._cuda_page[0][cuda_page_start : cuda_page_start + n_pages].copy_(
+                self._host_page[0][host_page_start : host_page_start + n_pages],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page_start : cuda_page_start + n_pages].copy_(
+                self._host_page[1][host_page_start : host_page_start + n_pages],
+                non_blocking=True,
+            )
 
 
 class HiCacheController(HiCacheTransferMixin):
