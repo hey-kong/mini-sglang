@@ -200,7 +200,7 @@ hicache_transfer_all_layer(const __grid_constant__ HicacheKernelParams params) {
   for (uint32_t i = work_id; i < length; i += kNumWorkers) {
     const auto pos_src = static_cast<const T *>(indices_src)[i];
     const auto pos_dst = static_cast<const T *>(indices_dst)[i];
-    for (uint32_t layer = 0; layer < num_layers; ++layer) {
+    for (uint32_t layer = 0; layer != num_layers; ++layer) {
       const auto k_cache_src = static_cast<const src_ptr_t *>(k_ptr_src)[layer];
       const auto v_cache_src = static_cast<const src_ptr_t *>(v_ptr_src)[layer];
       const auto k_cache_dst = static_cast<const dst_ptr_t *>(k_ptr_dst)[layer];
@@ -244,23 +244,24 @@ hicache_transfer_all_page(const __grid_constant__ HicacheKernelParams params) {
 
   const uint32_t work_id =
       blockIdx.x * kWorkersPerBlock + threadIdx.x / kNumThreads;
-  for (uint32_t i = work_id; i < length; i += kNumWorkers) {
-    const auto page_src = static_cast<const T *>(indices_src)[i];
-    const auto page_dst = static_cast<const T *>(indices_dst)[i];
-    for (uint32_t layer = 0; layer < num_layers; ++layer) {
-      const auto k_cache_src = static_cast<const src_ptr_t *>(k_ptr_src)[layer];
-      const auto v_cache_src = static_cast<const src_ptr_t *>(v_ptr_src)[layer];
-      const auto k_cache_dst = static_cast<const dst_ptr_t *>(k_ptr_dst)[layer];
-      const auto v_cache_dst = static_cast<const dst_ptr_t *>(v_ptr_dst)[layer];
-      const auto src_k = pointer::offset(k_cache_src, page_src * kv_cache_src_stride);
-      const auto dst_k = pointer::offset(k_cache_dst, page_dst * kv_cache_dst_stride);
-      const auto src_v = pointer::offset(v_cache_src, page_src * kv_cache_src_stride);
-      const auto dst_v = pointer::offset(v_cache_dst, page_dst * kv_cache_dst_stride);
-      const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
-      const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
-      store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
-      store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
-    }
+  const auto total_work = static_cast<uint64_t>(length) * num_layers;
+  for (uint64_t work = work_id; work < total_work; work += kNumWorkers) {
+    const auto layer = static_cast<uint32_t>(work / length);
+    const auto page_idx = static_cast<uint32_t>(work % length);
+    const auto page_src = static_cast<const T *>(indices_src)[page_idx];
+    const auto page_dst = static_cast<const T *>(indices_dst)[page_idx];
+    const auto k_cache_src = static_cast<const src_ptr_t *>(k_ptr_src)[layer];
+    const auto v_cache_src = static_cast<const src_ptr_t *>(v_ptr_src)[layer];
+    const auto k_cache_dst = static_cast<const dst_ptr_t *>(k_ptr_dst)[layer];
+    const auto v_cache_dst = static_cast<const dst_ptr_t *>(v_ptr_dst)[layer];
+    const auto src_k = pointer::offset(k_cache_src, page_src * kv_cache_src_stride);
+    const auto dst_k = pointer::offset(k_cache_dst, page_dst * kv_cache_dst_stride);
+    const auto src_v = pointer::offset(v_cache_src, page_src * kv_cache_src_stride);
+    const auto dst_v = pointer::offset(v_cache_dst, page_dst * kv_cache_dst_stride);
+    const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
+    const auto vec_v = load_vec<kElementSize, kNumThreads>(src_v);
+    store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+    store_vec<kElementSize, kNumThreads>(dst_v, vec_v);
   }
 }
 
