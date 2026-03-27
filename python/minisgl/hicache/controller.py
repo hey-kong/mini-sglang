@@ -110,44 +110,32 @@ class HiCacheTransferMixin:
         )
 
     def load_pages(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        from minisgl.kernel import transfer_hicache_all_page
+
         if len(host_indices) == 0:
             return
 
-        assert self._cuda_page is not None and self._host_page is not None
         assert len(host_indices) == len(cuda_indices)
         assert len(host_indices) % self.page_size == 0, \
             "page-wise load requires page-aligned length"
 
-        num_pages = len(host_indices) // self.page_size
+        host_page_indices = host_indices[::self.page_size] // self.page_size
+        cuda_page_indices = cuda_indices[::self.page_size] // self.page_size
+        page_stride_src = self._host_stride_bytes * self.page_size
+        page_stride_dst = self._cuda_stride_bytes * self.page_size
+        page_bytes = self._element_bytes * self.page_size
 
-        # fast path
-        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
-                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
-            host_page_start = int(host_indices[0].item()) // self.page_size
-            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
-
-            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[0][host_page_start:host_page_start + num_pages],
-                non_blocking=True,
-            )
-            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[1][host_page_start:host_page_start + num_pages],
-                non_blocking=True,
-            )
-            return
-
-        for i in range(num_pages):
-            host_page = int(host_indices[i * self.page_size].item()) // self.page_size
-            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
-
-            self._cuda_page[0][cuda_page].copy_(
-                self._host_page[0][host_page],
-                non_blocking=True,
-            )
-            self._cuda_page[1][cuda_page].copy_(
-                self._host_page[1][host_page],
-                non_blocking=True,
-            )
+        transfer_hicache_all_page(
+            k_ptr_dst=self._cuda_k_ptrs,
+            v_ptr_dst=self._cuda_v_ptrs,
+            indices_dst=cuda_page_indices,
+            k_ptr_src=self._host_k_ptrs,
+            v_ptr_src=self._host_v_ptrs,
+            indices_src=host_page_indices,
+            kv_cache_dst_stride_bytes=page_stride_dst,
+            kv_cache_src_stride_bytes=page_stride_src,
+            element_size=page_bytes,
+        )
 
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_layer

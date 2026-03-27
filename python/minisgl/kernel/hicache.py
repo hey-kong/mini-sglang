@@ -27,6 +27,7 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         cuda_wrappers=[
             ("launch_one", f"&HiCacheKernel<{args}>::run_one"),
             ("launch_all", f"&HiCacheKernel<{args}>::run_all"),
+            ("launch_page", f"&HiCacheKernel<{args}>::run_page"),
         ],
     )
 
@@ -138,6 +139,39 @@ def transfer_hicache_all_layer(
         block_quota=block_quota,
     )
     module.launch_all(
+        k_ptr_dst,
+        v_ptr_dst,
+        indices_dst,
+        k_ptr_src,
+        v_ptr_src,
+        indices_src,
+        kv_cache_src_stride_bytes,
+        kv_cache_dst_stride_bytes,
+    )
+
+
+def transfer_hicache_all_page(
+    k_ptr_dst: torch.Tensor,
+    v_ptr_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptr_src: torch.Tensor,
+    v_ptr_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    *,
+    kv_cache_src_stride_bytes: int,
+    kv_cache_dst_stride_bytes: int,
+    element_size: int,
+    unroll: int | None = None,  # can be tuned for performance
+    block_quota: int | None = None,  # can be tuned for less interference
+) -> None:
+    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+    unroll = unroll or _default_unroll(element_size)
+    module = _jit_hicache_module(
+        element_size=element_size,
+        unroll=unroll,
+        block_quota=block_quota,
+    )
+    module.launch_page(
         k_ptr_dst,
         v_ptr_dst,
         indices_dst,
