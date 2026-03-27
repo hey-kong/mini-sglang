@@ -234,7 +234,6 @@ hicache_transfer_all_page(const __grid_constant__ HicacheKernelParams params) {
 
   constexpr uint32_t kNumThreads = kWarpThreads / kUnroll;
   constexpr uint32_t kWorkersPerBlock = kBlockSize / kNumThreads;
-  constexpr uint32_t kNumWorkers = kWorkersPerBlock * kBlockQuota;
 
   const auto &[k_ptr_dst, v_ptr_dst, indices_dst, // dst
                k_ptr_src, v_ptr_src, indices_src, // src
@@ -242,18 +241,22 @@ hicache_transfer_all_page(const __grid_constant__ HicacheKernelParams params) {
                num_layers // metadata
   ] = params;
 
-  const uint32_t work_id =
-      blockIdx.x * kWorkersPerBlock + threadIdx.x / kNumThreads;
-  const auto total_work = static_cast<uint64_t>(length) * num_layers;
-  for (uint64_t work = work_id; work < total_work; work += kNumWorkers) {
-    const auto layer = static_cast<uint32_t>(work / length);
-    const auto page_idx = static_cast<uint32_t>(work % length);
-    const auto page_src = static_cast<const T *>(indices_src)[page_idx];
-    const auto page_dst = static_cast<const T *>(indices_dst)[page_idx];
-    const auto k_cache_src = static_cast<const src_ptr_t *>(k_ptr_src)[layer];
-    const auto v_cache_src = static_cast<const src_ptr_t *>(v_ptr_src)[layer];
-    const auto k_cache_dst = static_cast<const dst_ptr_t *>(k_ptr_dst)[layer];
-    const auto v_cache_dst = static_cast<const dst_ptr_t *>(v_ptr_dst)[layer];
+  const auto num_pages = length;
+  const auto num_blocks_per_layer = gridDim.x / num_layers;
+  const auto layer = blockIdx.x / num_blocks_per_layer;
+  const auto block_in_layer = blockIdx.x % num_blocks_per_layer;
+  const auto worker_in_block = threadIdx.x / kNumThreads;
+  const auto page_work_id = block_in_layer * kWorkersPerBlock + worker_in_block;
+  const auto num_page_workers = num_blocks_per_layer * kWorkersPerBlock;
+
+  const auto k_cache_src = static_cast<const src_ptr_t *>(k_ptr_src)[layer];
+  const auto v_cache_src = static_cast<const src_ptr_t *>(v_ptr_src)[layer];
+  const auto k_cache_dst = static_cast<const dst_ptr_t *>(k_ptr_dst)[layer];
+  const auto v_cache_dst = static_cast<const dst_ptr_t *>(v_ptr_dst)[layer];
+
+  for (uint32_t page = page_work_id; page < num_pages; page += num_page_workers) {
+    const auto page_src = static_cast<const T *>(indices_src)[page];
+    const auto page_dst = static_cast<const T *>(indices_dst)[page];
     const auto src_k = pointer::offset(k_cache_src, page_src * kv_cache_src_stride);
     const auto dst_k = pointer::offset(k_cache_dst, page_dst * kv_cache_dst_stride);
     const auto src_v = pointer::offset(v_cache_src, page_src * kv_cache_src_stride);
@@ -453,8 +456,9 @@ struct HiCacheKernel {
 
     constexpr auto kWorkersPerBlock =
         kBlockSize / (device::kWarpThreads / kUnroll);
-    const auto num_blocks =
+    const auto num_blocks_per_layer =
         std::min(div_ceil(length, kWorkersPerBlock), kBlockQuota);
+    const auto num_blocks = num_blocks_per_layer * static_cast<uint32_t>(N.unwrap());
     const auto params = HicacheKernelParams{
         .k_cache_dst = k_cache_dst_ptr,
         .v_cache_dst = v_cache_dst_ptr,
