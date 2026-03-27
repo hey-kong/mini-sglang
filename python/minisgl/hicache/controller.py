@@ -47,7 +47,6 @@ class Ack(NamedTuple):
 
 
 RING_SIZE = 3  # 3 is enough and safe
-WRITE_LENGTH_THRESHOLD = 64
 RESET_ACK_THRESHOLD = 512
 
 
@@ -220,7 +219,7 @@ class HiCacheController(HiCacheTransferMixin):
 
     def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
-        if needed_len < WRITE_LENGTH_THRESHOLD:
+        if needed_len < self.page_size:
             return
         host_indices = self._try_allocate_host(needed_len)
         if host_indices is None:
