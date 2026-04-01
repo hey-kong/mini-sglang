@@ -13,9 +13,6 @@ if TYPE_CHECKING:
     from .utils import PendingReq
 
 
-HICACHE_LOAD_LENGTH_THRESHOLD = 16
-
-
 class CacheManager:
     def __init__(self, num_pages: int, page_table: torch.Tensor, config: SchedulerConfig):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
@@ -36,7 +33,7 @@ class CacheManager:
 
     def prepare_load_host(self, host_handle: BaseCacheHandle, cuda_handle: BaseCacheHandle):
         needed_len = host_handle.cached_len - cuda_handle.cached_len
-        if needed_len < HICACHE_LOAD_LENGTH_THRESHOLD:
+        if needed_len < self.page_size:
             return cuda_handle
         assert needed_len % self.page_size == 0, "allocation must be page-aliged"
         indices = self._page_to_token(self._allocate(needed_len // self.page_size))

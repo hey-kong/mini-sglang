@@ -71,8 +71,7 @@ class HiCacheTransferMixin:
         self.page_size = config.page_size
         item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
-        # page-major views: [num_pages, page_size, num_layers, num_kv_heads, head_dim]
-        # one page slice is contiguous in page_first layout.
+        # [num_pages, page_size, num_layers, num_kv_heads, head_dim]
         self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
         self._host_page = [t.permute(1, 2, 0, 3, 4) for t in host_kv]
         # 2D list of tensors with shape [num_tokens, num_kv_heads * head_dim]
@@ -114,6 +113,38 @@ class HiCacheTransferMixin:
             element_size=self._element_bytes,
         )
 
+    def load_pages(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
+        num_pages = len(host_indices) // self.page_size
+
+        # fast path
+        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
+                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
+            host_page_start = int(host_indices[0].item()) // self.page_size
+            cuda_page_start = int(cuda_indices[0].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_page_start:host_page_start + num_pages],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
+                self._host_page[1][host_page_start:host_page_start + num_pages],
+                non_blocking=True,
+            )
+            return
+
+        for i in range(num_pages):
+            host_page = int(host_indices[i * self.page_size].item()) // self.page_size
+            cuda_page = int(cuda_indices[i * self.page_size].item()) // self.page_size
+
+            self._cuda_page[0][cuda_page].copy_(
+                self._host_page[0][host_page],
+                non_blocking=True,
+            )
+            self._cuda_page[1][cuda_page].copy_(
+                self._host_page[1][host_page],
+                non_blocking=True,
+            )
+
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         from minisgl.kernel import transfer_hicache_all_layer
 
@@ -141,6 +172,11 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
+        self.pagewise_load = (
+            config.device_mem_layout == "page_first"
+            and config.host_mem_layout == "page_first"
+            and not self.use_layerwise
+        )
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
@@ -202,6 +238,8 @@ class HiCacheController(HiCacheTransferMixin):
                 for i in range(self.num_layers):
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
+            elif self.pagewise_load:
+                self.load_pages(host_indices=host_indices, cuda_indices=cuda_indices)
             else:
                 self.load_all(host_indices=host_indices, cuda_indices=cuda_indices)
             counter.finish_event.record(self.load_stream)
@@ -226,7 +264,6 @@ class HiCacheController(HiCacheTransferMixin):
         start_event.record(self.write_stream)
         with self.write_stream_ctx:
             self.write_stream.wait_stream(current_stream)
-            # TODO: refactor this kernel
             self.store_all(host_indices, cuda_indices)
 
         # NOTE: must record stream to avoid use after free
