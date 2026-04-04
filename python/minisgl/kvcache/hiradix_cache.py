@@ -297,24 +297,6 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
-    def release_cuda(self, handle: BaseCacheHandle, length: int) -> torch.Tensor:
-        assert isinstance(handle, HiRadixCacheHandle)
-        node = handle.node
-        released: List[torch.Tensor] = []
-        while not node.is_root() and length > 0:
-            assert node._cuda_value is not None and node._host_value is not None
-            released.append(node.cuda_value)
-            node.cuda_value = None
-            if node.ref_count == 0:
-                self.evictable_size -= node.length
-            else:
-                self.protected_size -= node.length
-            length -= node.length
-            node = node.parent
-        assert length == 0
-        released.reverse()
-        return torch.cat(released)
-
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
 
