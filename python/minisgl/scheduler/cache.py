@@ -29,7 +29,6 @@ class CacheManager:
 
             self._hicache_controller = HiCacheController(self._prefix_cache, num_pages, config)
             self.start_load_host = self._hicache_controller.start_load
-            self.refresh_hicache = self._hicache_controller.refresh
 
     def prepare_load_host(self, host_handle: BaseCacheHandle, cuda_handle: BaseCacheHandle):
         needed_len = host_handle.cached_len - cuda_handle.cached_len
@@ -107,6 +106,13 @@ class CacheManager:
             )
         if self.page_size > 1:
             assert torch.all(self._free_slots % self.page_size == 0)
+
+    def refresh_hicache(self, tp_cpu_group) -> None:
+        if not self.enable_hicache:
+            return
+        released = self._hicache_controller.refresh(tp_cpu_group)
+        if released:
+            self._free_slots = torch.cat([self._free_slots] + [x[:: self.page_size] for x in released])
 
     @contextmanager
     def lazy_free_region(self):
