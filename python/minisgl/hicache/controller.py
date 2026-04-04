@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, NamedTuple, cast
 
@@ -32,9 +33,16 @@ class HiCacheCounter:
     def wait(self, layer_id: int) -> None:
         current_stream = torch.cuda.current_stream()
         if self.use_layerwise:
-            current_stream.wait_event(self.events[layer_id])
+            wait_event = self.events[layer_id]
         else:
-            current_stream.wait_event(self.finish_event)
+            wait_event = self.finish_event
+        tic = time.perf_counter_ns()
+        current_stream.wait_event(wait_event)
+        sync_event = _create_event()
+        sync_event.record(current_stream)
+        sync_event.synchronize()
+        dur_ms = (time.perf_counter_ns() - tic) / 1e6
+        logger.info_rank0(f"HiCache Wait  [layer={layer_id:>2}]: {dur_ms:>6.3f} ms")
 
 
 class Transaction(NamedTuple):
