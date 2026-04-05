@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, NamedTuple, cast
 
@@ -20,6 +21,8 @@ logger = init_logger(__name__)
 class HiCacheCounter:
     num_layers: int
     use_layerwise: bool = True
+    start_load_tic_ns: int | None = None
+    fi_gap_logged: bool = False
     start_event: torch.Event = field(init=False)
     finish_event: torch.Event = field(init=False)
     events: List[torch.Event] = field(init=False)
@@ -35,6 +38,13 @@ class HiCacheCounter:
             current_stream.wait_event(self.events[layer_id])
         else:
             current_stream.wait_event(self.finish_event)
+
+    def log_forward_gap(self, layer_id: int, backend: str) -> None:
+        if layer_id != 0 or self.start_load_tic_ns is None or self.fi_gap_logged:
+            return
+        dur_ms = (time.perf_counter_ns() - self.start_load_tic_ns) / 1e6
+        logger.info_rank0(f"HiCache Gap   [start_load->{backend}.forward]: {dur_ms:>6.3f} ms")
+        self.fi_gap_logged = True
 
 
 class Transaction(NamedTuple):
@@ -227,6 +237,8 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
         counter.use_layerwise = self.use_layerwise
+        counter.start_load_tic_ns = time.perf_counter_ns()
+        counter.fi_gap_logged = False
         self.cuda_pool.set_hicache_counter(counter)
         host_indices, cuda_indices = self._merge_transactions(self.load_queue)
         num_tokens = len(host_indices)
