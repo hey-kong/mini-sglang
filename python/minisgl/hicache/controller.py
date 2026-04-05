@@ -21,6 +21,8 @@ logger = init_logger(__name__)
 class HiCacheCounter:
     num_layers: int
     use_layerwise: bool = True
+    start_load_tic_ns: int | None = None
+    fi_gap_logged: bool = False
     start_event: torch.Event = field(init=False)
     finish_event: torch.Event = field(init=False)
     events: List[torch.Event] = field(init=False)
@@ -36,6 +38,13 @@ class HiCacheCounter:
             current_stream.wait_event(self.events[layer_id])
         else:
             current_stream.wait_event(self.finish_event)
+
+    def log_forward_gap(self, layer_id: int, backend: str) -> None:
+        if layer_id != 0 or self.start_load_tic_ns is None or self.fi_gap_logged:
+            return
+        dur_ms = (time.perf_counter_ns() - self.start_load_tic_ns) / 1e6
+        logger.info_rank0(f"HiCache Gap   [start_load->{backend}.forward]: {dur_ms:>6.3f} ms")
+        self.fi_gap_logged = True
 
 
 class Transaction(NamedTuple):
@@ -179,7 +188,6 @@ class HiCacheController(HiCacheTransferMixin):
             and not self.use_layerwise
         )
         self.ring_index = 0
-        self._last_start_load_tic_ns: int | None = None
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
         num_host_pages = int(num_pages * config.hicache_ratio)
@@ -226,10 +234,11 @@ class HiCacheController(HiCacheTransferMixin):
     def start_load(self) -> None:
         if not self.load_queue:
             return self.cuda_pool.set_hicache_counter(None)
-        self._last_start_load_tic_ns = time.perf_counter_ns()
         self.ring_index = (self.ring_index + 1) % RING_SIZE
         counter = self.counter_ring_buffer[self.ring_index]
         counter.use_layerwise = self.use_layerwise
+        counter.start_load_tic_ns = time.perf_counter_ns()
+        counter.fi_gap_logged = False
         self.cuda_pool.set_hicache_counter(counter)
         host_indices, cuda_indices = self._merge_transactions(self.load_queue)
         num_tokens = len(host_indices)
@@ -254,13 +263,6 @@ class HiCacheController(HiCacheTransferMixin):
         ack_id = self._allocate_ack_id()
         self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
-
-    def log_start_load_to_forward_gap(self) -> None:
-        if self._last_start_load_tic_ns is None:
-            return
-        dur_ms = (time.perf_counter_ns() - self._last_start_load_tic_ns) / 1e6
-        logger.info_rank0(f"HiCache Gap   [start_load->forward]: {dur_ms:>6.3f} ms")
-        self._last_start_load_tic_ns = None
 
     def start_write(self) -> None:
         if not self.write_queue:

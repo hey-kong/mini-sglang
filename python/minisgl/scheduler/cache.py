@@ -40,10 +40,6 @@ class CacheManager:
         self._hicache_controller.prepare_load(host_handle, cuda_handle, indices)
         return host_handle
 
-    def log_start_load_to_forward_gap(self) -> None:
-        if self.enable_hicache:
-            self._hicache_controller.log_start_load_to_forward_gap()
-
     def match_req(self, req: PendingReq) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
