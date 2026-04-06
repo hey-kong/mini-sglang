@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, NamedTuple, cast
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, cast
 
 import torch
 import torch.distributed as dist
@@ -41,11 +41,13 @@ class Transaction(NamedTuple):
     handle: BaseCacheHandle
     host_list: List[torch.Tensor]
     cuda_list: List[torch.Tensor]
+    demote_len: int = 0
 
 
 class Ack(NamedTuple):
     ack_id: int
     handles: List[BaseCacheHandle]
+    demote_lens: List[int]
     num_tokens: int
     start_event: torch.Event
     finish_event: torch.Event
@@ -162,8 +164,15 @@ class HiCacheTransferMixin:
 
 
 class HiCacheController(HiCacheTransferMixin):
-    def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
+    def __init__(
+            self,
+            prefix_cache: BasePrefixCache,
+            num_pages: int,
+            config: SchedulerConfig,
+            free_cuda_slots: Callable[[torch.Tensor], None],
+    ):
         self.hiradix_cache = cast("HiRadixPrefixCache", prefix_cache)
+        self.free_cuda_slots = free_cuda_slots
         self.load_queue: List[Transaction] = []
         self.write_queue: List[Transaction] = []
         self.ack_load_queue: List[Ack] = []
@@ -172,6 +181,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
+        self.hicache_quick_demotion = config.hicache_quick_demotion
         self.pagewise_load = (
             config.device_mem_layout == "page_first"
             and config.host_mem_layout == "page_first"
@@ -218,7 +228,8 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(host_indices) == needed_len
         cuda_list = self.hiradix_cache.set_host(cuda_handle, host_indices)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
-        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list))
+        demote_len = needed_len if self.hicache_quick_demotion else 0
+        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list, demote_len))
         self.start_write()  # do not batch write for now
 
     def start_load(self) -> None:
@@ -249,13 +260,14 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
+        self.ack_load_queue.append(Ack(ack_id, [], [], num_tokens, counter.start_event, counter.finish_event))
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
 
     def start_write(self) -> None:
         if not self.write_queue:
             return
         handles = [tx.handle for tx in self.write_queue]
+        demote_lens = [tx.demote_len for tx in self.write_queue]
         host_indices, cuda_indices = self._merge_transactions(self.write_queue)
         num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
@@ -272,7 +284,7 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.write_stream)
         self.write_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_write_queue.append(Ack(ack_id, handles, num_tokens, start_event, finish_event))
+        self.ack_write_queue.append(Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event))
         logger.info_rank0(f"HiCache Write [{ack_id}]: {num_tokens:>5} tokens")
 
     def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
@@ -298,17 +310,19 @@ class HiCacheController(HiCacheTransferMixin):
 
         for ack in self.ack_write_queue[:finish_count]:
             self._log_transaction(ack, "Write")
-            for handle in ack.handles:
+            for handle, demote_len in zip(ack.handles, ack.demote_lens):
                 self.hiradix_cache.lock_handle(handle, unlock=True)
+                if demote_len > 0:
+                    self.free_cuda_slots(self.hiradix_cache.drop_cuda(handle, demote_len))
         self.ack_write_queue = self.ack_write_queue[finish_count:]
 
     def _merge_transactions(self, txs: List[Transaction]):
         assert len(txs) > 0
         host_list: List[torch.Tensor] = []
         cuda_list: List[torch.Tensor] = []
-        for _, host_values, cuda_values in txs:
-            host_list.extend(host_values)
-            cuda_list.extend(cuda_values)
+        for tx in txs:
+            host_list.extend(tx.host_list)
+            cuda_list.extend(tx.cuda_list)
         host_indices, cuda_indices = torch.cat(host_list), torch.cat(cuda_list)
         return host_indices.to(self.device, non_blocking=True), cuda_indices
 
