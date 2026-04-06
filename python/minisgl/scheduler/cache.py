@@ -22,12 +22,18 @@ class CacheManager:
         self.device = device = page_table.device
         self.num_pages = num_pages
         self.enable_hicache = config.cache_type == "hiradix"
+        self.enable_hot_aware_hiradix = config.enable_hot_aware_hiradix
         self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
         self._prefix_cache = create_prefix_cache(device=device, type=config.cache_type)
         if self.enable_hicache:
             from minisgl.hicache import HiCacheController
 
-            self._hicache_controller = HiCacheController(self._prefix_cache, num_pages, config)
+            self._hicache_controller = HiCacheController(
+                self._prefix_cache,
+                num_pages,
+                config,
+                free_cuda_indices=lambda indices: self._free(indices),
+            )
             self.start_load_host = self._hicache_controller.start_load
             self.refresh_hicache = self._hicache_controller.refresh
 
@@ -85,7 +91,10 @@ class CacheManager:
         old_handle = req.cache_handle
         cached_len, new_handle = self._prefix_cache.insert_prefix(insert_ids, page_indices)
         if self.enable_hicache:
-            self._hicache_controller.prepare_write(new_handle)
+            self._hicache_controller.prepare_write(
+                new_handle,
+                drop_cuda_after_write=finished and self.enable_hot_aware_hiradix,
+            )
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it

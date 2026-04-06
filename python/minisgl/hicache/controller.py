@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, NamedTuple, cast
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, cast
 
 import torch
 import torch.distributed as dist
@@ -41,11 +41,15 @@ class Transaction(NamedTuple):
     handle: BaseCacheHandle
     host_list: List[torch.Tensor]
     cuda_list: List[torch.Tensor]
+    drop_len: int = 0
+    drop_cuda_after_write: bool = False
 
 
 class Ack(NamedTuple):
     ack_id: int
     handles: List[BaseCacheHandle]
+    drop_lens: List[int]
+    drop_flags: List[bool]
     num_tokens: int
     start_event: torch.Event
     finish_event: torch.Event
@@ -162,13 +166,24 @@ class HiCacheTransferMixin:
 
 
 class HiCacheController(HiCacheTransferMixin):
-    def __init__(self, prefix_cache: BasePrefixCache, num_pages: int, config: SchedulerConfig):
+    def __init__(
+            self,
+            prefix_cache: BasePrefixCache,
+            num_pages: int,
+            config: SchedulerConfig,
+            free_cuda_indices: Callable[[torch.Tensor], None] | None = None,
+    ):
         self.hiradix_cache = cast("HiRadixPrefixCache", prefix_cache)
+        self.free_cuda_indices = free_cuda_indices
         self.load_queue: List[Transaction] = []
         self.write_queue: List[Transaction] = []
         self.ack_load_queue: List[Ack] = []
         self.ack_write_queue: List[Ack] = []
         self.ack_cnt = 0
+        self.hot_aware_enabled = config.enable_hot_aware_hiradix
+        self.released_cuda_tokens = 0
+        self.released_cuda_acks = 0
+        self.write_ack_processed = 0
         self.cuda_pool = get_global_ctx().kv_cache
         self.num_layers = self.cuda_pool.num_layers
         self.use_layerwise = config.use_layerwise
@@ -208,7 +223,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.hiradix_cache.lock_handle(cuda_handle, unlock=True)
         self.load_queue.append(Transaction(host_handle, host_list, [cuda_indices]))
 
-    def prepare_write(self, cuda_handle: BaseCacheHandle) -> None:
+    def prepare_write(self, cuda_handle: BaseCacheHandle, drop_cuda_after_write: bool = False) -> None:
         needed_len = self.hiradix_cache.get_writable_length(cuda_handle)
         if needed_len < self.page_size:
             return
@@ -218,7 +233,15 @@ class HiCacheController(HiCacheTransferMixin):
         assert len(host_indices) == needed_len
         cuda_list = self.hiradix_cache.set_host(cuda_handle, host_indices)
         self.hiradix_cache.lock_handle(cuda_handle, unlock=False)
-        self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list))
+        self.write_queue.append(
+            Transaction(
+                cuda_handle,
+                [host_indices],
+                cuda_list,
+                drop_len=needed_len,
+                drop_cuda_after_write=drop_cuda_after_write,
+            )
+        )
         self.start_write()  # do not batch write for now
 
     def start_load(self) -> None:
@@ -249,13 +272,17 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_load_queue.append(Ack(ack_id, [], num_tokens, counter.start_event, counter.finish_event))
+        self.ack_load_queue.append(
+            Ack(ack_id, [], [], [], num_tokens, counter.start_event, counter.finish_event)
+        )
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
 
     def start_write(self) -> None:
         if not self.write_queue:
             return
         handles = [tx.handle for tx in self.write_queue]
+        drop_lens = [tx.drop_len for tx in self.write_queue]
+        drop_flags = [tx.drop_cuda_after_write for tx in self.write_queue]
         host_indices, cuda_indices = self._merge_transactions(self.write_queue)
         num_tokens = len(host_indices)
         current_stream = torch.cuda.current_stream()
@@ -272,7 +299,9 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.write_stream)
         self.write_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_write_queue.append(Ack(ack_id, handles, num_tokens, start_event, finish_event))
+        self.ack_write_queue.append(
+            Ack(ack_id, handles, drop_lens, drop_flags, num_tokens, start_event, finish_event)
+        )
         logger.info_rank0(f"HiCache Write [{ack_id}]: {num_tokens:>5} tokens")
 
     def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
@@ -296,19 +325,44 @@ class HiCacheController(HiCacheTransferMixin):
         dist.all_reduce(finish_count, op=dist.ReduceOp.MIN, group=tp_cpu_group)
         finish_count = int(finish_count)
 
+        released_tokens_this_round = 0
+        released_acks_this_round = 0
+
         for ack in self.ack_write_queue[:finish_count]:
             self._log_transaction(ack, "Write")
-            for handle in ack.handles:
+            self.write_ack_processed += 1
+            for handle, drop_len, do_drop in zip(ack.handles, ack.drop_lens, ack.drop_flags):
                 self.hiradix_cache.lock_handle(handle, unlock=True)
+                if do_drop and drop_len > 0:
+                    released = self.hiradix_cache.drop_cuda_suffix(handle, drop_len)
+                    if len(released) > 0 and self.free_cuda_indices is not None:
+                        self.free_cuda_indices(released)
+                        released_tokens_this_round += int(len(released))
+                        released_acks_this_round += 1
         self.ack_write_queue = self.ack_write_queue[finish_count:]
+
+        if released_tokens_this_round > 0:
+            self.released_cuda_tokens += released_tokens_this_round
+            self.released_cuda_acks += released_acks_this_round
+
+        if self.hot_aware_enabled and (finish_count > 0 or released_tokens_this_round > 0):
+            logger.info_rank0(
+                "HiCache HotAware: "
+                f"released_cuda_tokens_round={released_tokens_this_round}, "
+                f"released_cuda_tokens_total={self.released_cuda_tokens}, "
+                f"released_ack_round={released_acks_this_round}, "
+                f"released_ack_total={self.released_cuda_acks}, "
+                f"write_ack_processed_total={self.write_ack_processed}, "
+                f"write_ack_pending={len(self.ack_write_queue)}"
+            )
 
     def _merge_transactions(self, txs: List[Transaction]):
         assert len(txs) > 0
         host_list: List[torch.Tensor] = []
         cuda_list: List[torch.Tensor] = []
-        for _, host_values, cuda_values in txs:
-            host_list.extend(host_values)
-            cuda_list.extend(cuda_values)
+        for tx in txs:
+            host_list.extend(tx.host_list)
+            cuda_list.extend(tx.cuda_list)
         host_indices, cuda_indices = torch.cat(host_list), torch.cat(cuda_list)
         return host_indices.to(self.device, non_blocking=True), cuda_indices
 

@@ -225,6 +225,16 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--enable-hot-aware-hiradix",
+        action="store_true",
+        dest="enable_hot_aware_hiradix",
+        help=(
+            "Enable hot-aware HiRadix policy: write-backed decode delta will be dropped "
+            "from CUDA after write ACK to preserve hot prefixes on GPU."
+        ),
+    )
+
+    parser.add_argument(
         "--device-mem-layout",
         "--device-layout",
         type=str,

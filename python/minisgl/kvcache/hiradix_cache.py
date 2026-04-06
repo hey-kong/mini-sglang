@@ -297,6 +297,34 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
+    def drop_cuda_suffix(self, handle: BaseCacheHandle, drop_len: int) -> torch.Tensor:
+        assert isinstance(handle, HiRadixCacheHandle)
+        assert drop_len >= 0 and drop_len % self.page_size == 0
+        if drop_len == 0:
+            return self.empty_tensor
+
+        node = handle.node
+        left = drop_len
+        released: List[torch.Tensor] = []
+
+        while not node.is_root() and left > 0:
+            if node._cuda_value is None:
+                break
+            if node._host_value is None:
+                raise RuntimeError("Cannot drop CUDA suffix without host backup")
+            if node.ref_count > 0:
+                break
+
+            released.append(node.cuda_value)
+            self.evictable_size -= node.length
+            node.cuda_value = None
+            left -= node.length
+            node = node.parent
+
+        if len(released) == 0:
+            return self.empty_tensor
+        return torch.cat(released)
+
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
 

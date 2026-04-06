@@ -19,6 +19,7 @@ class SchedulerConfig(EngineConfig):
     hicache_ratio: float = 2.0
     host_mem_layout: str = "layer_first"
     use_layerwise: bool = True
+    enable_hot_aware_hiradix: bool = False
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
