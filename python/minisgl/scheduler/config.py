@@ -17,6 +17,7 @@ class SchedulerConfig(EngineConfig):
     cache_type: str = "radix"
     offline_mode: bool = False
     hicache_ratio: float = 2.0
+    hicache_quick_demotion: bool = False
     host_mem_layout: str = "layer_first"
     use_layerwise: bool = True
 

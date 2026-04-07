@@ -297,6 +297,38 @@ class HiRadixPrefixCache(BasePrefixCache):
         result.reverse()
         return result
 
+    def drop_cuda(self, handle: BaseCacheHandle, length: int) -> tuple[torch.Tensor, int]:
+        assert isinstance(handle, HiRadixCacheHandle)
+        assert length >= 0
+        if length == 0:
+            logger.info_rank0("HiCache Quick Demotion: dropped 0 tokens")
+            return self.empty_tensor, 0
+        node = handle.node
+        dropped_len = 0
+        dropped_indices: List[torch.Tensor] = []
+        while not node.is_root() and dropped_len < length:
+            assert node._host_value is not None and node._cuda_value is not None
+            if node.ref_count > 0:
+                logger.debug_rank0(
+                    "HiCache Quick Demotion: skip dropping locked node "
+                    f"(uuid={node.uuid}, ref_count={node.ref_count}, length={node.length})"
+                )
+                break
+            dropped_len += node.length
+            dropped_indices.append(node.cuda_value)
+            self.evictable_size -= node.length
+            node.cuda_value = None
+            node = node.parent
+        if dropped_len != length:
+            logger.info_rank0(
+                f"HiCache Quick Demotion: dropped {dropped_len} / {length} tokens "
+                "(remaining tokens are still referenced)"
+            )
+        else:
+            logger.info_rank0(f"HiCache Quick Demotion: dropped {dropped_len} tokens")
+        dropped = torch.cat(dropped_indices) if dropped_indices else self.empty_tensor
+        return dropped, dropped_len
+
     def reset(self) -> None:
         raise NotImplementedError("HiRadixPrefixCache.reset is not implemented")
 

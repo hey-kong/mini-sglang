@@ -27,7 +27,12 @@ class CacheManager:
         if self.enable_hicache:
             from minisgl.hicache import HiCacheController
 
-            self._hicache_controller = HiCacheController(self._prefix_cache, num_pages, config)
+            self._hicache_controller = HiCacheController(
+                self._prefix_cache,
+                num_pages,
+                config,
+                free_cuda_slots=lambda indices: self._free(indices),
+            )
             self.start_load_host = self._hicache_controller.start_load
             self.refresh_hicache = self._hicache_controller.refresh
 
