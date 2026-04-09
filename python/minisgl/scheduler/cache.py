@@ -126,7 +126,15 @@ class CacheManager:
             yield
         finally:
             del self._free
-            self._free_slots = torch.cat([self._free_slots] + lazy_free_list)
+            if not lazy_free_list:
+                return
+            # Keep lazy-free behavior consistent with `_free` by deduplicating pages and
+            # filtering out pages that are already in the free list.
+            freed_pages = torch.unique(torch.cat(lazy_free_list))
+            if len(self._free_slots) > 0:
+                freed_pages = freed_pages[~torch.isin(freed_pages, self._free_slots)]
+            if len(freed_pages) > 0:
+                self._free_slots = torch.cat([self._free_slots, freed_pages])
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self._free_slots)):
