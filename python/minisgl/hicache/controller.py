@@ -71,7 +71,6 @@ class HiCacheTransferMixin:
         self.num_layers, _, _, num_kv_heads, head_dim = cuda_kv[0].shape
         self.device = cuda_kv[0].device
         self.page_size = config.page_size
-        item_bytes = cuda_kv[0].element_size()
         storage_shape = (-1, num_kv_heads * head_dim)
         # [num_pages, page_size, num_layers, num_kv_heads, head_dim]
         self._cuda_page = [t.permute(1, 2, 0, 3, 4) for t in cuda_kv]
@@ -80,40 +79,71 @@ class HiCacheTransferMixin:
         self._cuda_kv = [[t.view(storage_shape) for t in kv] for kv in cuda_kv]
         self._host_kv = [[t.view(storage_shape) for t in kv] for kv in host_kv]
         del cuda_kv, host_kv  # free original references to avoid confusion
-        self._cuda_stride_bytes = self._cuda_kv[0][0].stride(0) * item_bytes
-        self._host_stride_bytes = self._host_kv[0][0].stride(0) * item_bytes
-        self._element_bytes = self._cuda_kv[0][0].shape[-1] * item_bytes
-        self._cuda_k_ptrs = _make_ptrs(self._cuda_kv[0], self.device)
-        self._cuda_v_ptrs = _make_ptrs(self._cuda_kv[1], self.device)
-        self._host_k_ptrs = _make_ptrs(self._host_kv[0], self.device)
-        self._host_v_ptrs = _make_ptrs(self._host_kv[1], self.device)
+
+    @staticmethod
+    def _index_list(indices: torch.Tensor) -> List[int]:
+        if indices.device.type != "cpu":
+            indices = indices.cpu()
+        return cast(List[int], indices.tolist())
+
+    @staticmethod
+    def _copy_indexed_rows(
+            dst: torch.Tensor,
+            dst_indices: List[int],
+            src: torch.Tensor,
+            src_indices: List[int],
+    ) -> None:
+        assert len(dst_indices) == len(src_indices)
+        offset = 0
+        num_indices = len(dst_indices)
+        while offset < num_indices:
+            dst_start = dst_indices[offset]
+            src_start = src_indices[offset]
+            run_len = 1
+            while (
+                    offset + run_len < num_indices
+                    and dst_indices[offset + run_len] == dst_start + run_len
+                    and src_indices[offset + run_len] == src_start + run_len
+            ):
+                run_len += 1
+            dst[dst_start:dst_start + run_len].copy_(
+                src[src_start:src_start + run_len],
+                non_blocking=True,
+            )
+            offset += run_len
 
     def load_one(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor, i: int) -> None:
-        from minisgl.kernel import transfer_hicache_one_layer
-
-        transfer_hicache_one_layer(
-            k_cache_dst=self._cuda_kv[0][i],
-            v_cache_dst=self._cuda_kv[1][i],
-            indices_dst=cuda_indices,
-            k_cache_src=self._host_kv[0][i],
-            v_cache_src=self._host_kv[1][i],
-            indices_src=host_indices,
+        host_index_list = self._index_list(host_indices)
+        cuda_index_list = self._index_list(cuda_indices)
+        self._copy_indexed_rows(
+            self._cuda_kv[0][i],
+            cuda_index_list,
+            self._host_kv[0][i],
+            host_index_list,
+        )
+        self._copy_indexed_rows(
+            self._cuda_kv[1][i],
+            cuda_index_list,
+            self._host_kv[1][i],
+            host_index_list,
         )
 
     def load_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
-        from minisgl.kernel import transfer_hicache_all_layer
-
-        transfer_hicache_all_layer(
-            k_ptr_dst=self._cuda_k_ptrs,
-            v_ptr_dst=self._cuda_v_ptrs,
-            indices_dst=cuda_indices,
-            k_ptr_src=self._host_k_ptrs,
-            v_ptr_src=self._host_v_ptrs,
-            indices_src=host_indices,
-            kv_cache_dst_stride_bytes=self._cuda_stride_bytes,
-            kv_cache_src_stride_bytes=self._host_stride_bytes,
-            element_size=self._element_bytes,
-        )
+        host_index_list = self._index_list(host_indices)
+        cuda_index_list = self._index_list(cuda_indices)
+        for i in range(self.num_layers):
+            self._copy_indexed_rows(
+                self._cuda_kv[0][i],
+                cuda_index_list,
+                self._host_kv[0][i],
+                host_index_list,
+            )
+            self._copy_indexed_rows(
+                self._cuda_kv[1][i],
+                cuda_index_list,
+                self._host_kv[1][i],
+                host_index_list,
+            )
 
     def load_pages(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
         num_pages = len(host_indices) // self.page_size
@@ -148,19 +178,21 @@ class HiCacheTransferMixin:
             )
 
     def store_all(self, host_indices: torch.Tensor, cuda_indices: torch.Tensor) -> None:
-        from minisgl.kernel import transfer_hicache_all_layer
-
-        transfer_hicache_all_layer(
-            k_ptr_dst=self._host_k_ptrs,
-            v_ptr_dst=self._host_v_ptrs,
-            indices_dst=host_indices,
-            k_ptr_src=self._cuda_k_ptrs,
-            v_ptr_src=self._cuda_v_ptrs,
-            indices_src=cuda_indices,
-            kv_cache_dst_stride_bytes=self._host_stride_bytes,
-            kv_cache_src_stride_bytes=self._cuda_stride_bytes,
-            element_size=self._element_bytes,
-        )
+        host_index_list = self._index_list(host_indices)
+        cuda_index_list = self._index_list(cuda_indices)
+        for i in range(self.num_layers):
+            self._copy_indexed_rows(
+                self._host_kv[0][i],
+                host_index_list,
+                self._cuda_kv[0][i],
+                cuda_index_list,
+            )
+            self._copy_indexed_rows(
+                self._host_kv[1][i],
+                host_index_list,
+                self._cuda_kv[1][i],
+                cuda_index_list,
+            )
 
 
 class HiCacheController(HiCacheTransferMixin):
@@ -371,7 +403,3 @@ class HiCacheController(HiCacheTransferMixin):
 # NOTE: skip the annoying type checking here...
 def _create_event(enable_timing: bool = False) -> torch.Event:
     return torch.cuda.Event(enable_timing=enable_timing)  # type: ignore
-
-
-def _make_ptrs(ts: List[torch.Tensor], device: torch.device):
-    return torch.tensor([t.data_ptr() for t in ts], device=device, dtype=torch.uint64)
