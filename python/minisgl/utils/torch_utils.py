@@ -65,12 +65,25 @@ def nvtx_annotate(name: str, layer_id_field: str | None = None):
             display_name = name
             if layer_id_field and hasattr(self, layer_id_field):
                 display_name = name.format(getattr(self, layer_id_field))
+            timer = None
+            layer_id = None
+            if layer_id_field and hasattr(self, layer_id_field):
+                from minisgl.core import get_global_ctx_optional
+
+                ctx = get_global_ctx_optional()
+                timer = ctx.prefill_layer_timer if ctx is not None else None
+                layer_id = getattr(self, layer_id_field)
+                if timer is not None:
+                    timer.start_layer(layer_id)
+
             stack = _nvtx_stack()
             nvtx.range_push(display_name)
             stack.append(display_name)
             try:
                 return fn(self, *args, **kwargs)
             finally:
+                if timer is not None:
+                    timer.end_layer(layer_id)
                 stack.pop()
                 nvtx.range_pop()
 
