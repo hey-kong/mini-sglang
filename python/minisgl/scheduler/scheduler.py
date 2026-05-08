@@ -208,7 +208,7 @@ class Scheduler(SchedulerIOMixin):
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
         if self.cache_manager.enable_hicache:
-            self.cache_manager.start_load_host()
+            self.cache_manager.start_load_host(batch.is_prefill)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),

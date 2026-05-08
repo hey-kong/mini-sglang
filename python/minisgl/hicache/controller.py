@@ -22,12 +22,16 @@ class HiCacheCounter:
     use_layerwise: bool = True
     start_event: torch.Event = field(init=False)
     finish_event: torch.Event = field(init=False)
+    layer_start_events: List[torch.Event] = field(init=False)
     events: List[torch.Event] = field(init=False)
 
     def __post_init__(self):
         self.start_event = _create_event(enable_timing=True)
         self.finish_event = _create_event(enable_timing=True)
-        self.events = [_create_event() for _ in range(self.num_layers)]
+        self.layer_start_events = [
+            _create_event(enable_timing=True) for _ in range(self.num_layers)
+        ]
+        self.events = [_create_event(enable_timing=True) for _ in range(self.num_layers)]
 
     def wait(self, layer_id: int) -> None:
         current_stream = torch.cuda.current_stream()
@@ -51,6 +55,9 @@ class Ack(NamedTuple):
     num_tokens: int
     start_event: torch.Event
     finish_event: torch.Event
+    is_prefill: bool = False
+    layer_start_events: List[torch.Event] | None = None
+    layer_finish_events: List[torch.Event] | None = None
 
 
 RING_SIZE = 3  # 3 is enough and safe
@@ -59,10 +66,10 @@ RESET_ACK_THRESHOLD = 512
 
 class HiCacheTransferMixin:
     def __init__(
-            self,
-            cuda_kv: List[torch.Tensor],
-            host_kv: List[torch.Tensor],
-            config: SchedulerConfig,
+        self,
+        cuda_kv: List[torch.Tensor],
+        host_kv: List[torch.Tensor],
+        config: SchedulerConfig,
     ) -> None:
         self.load_stream = torch.cuda.Stream()
         self.write_stream = torch.cuda.Stream()
@@ -119,17 +126,19 @@ class HiCacheTransferMixin:
         num_pages = len(host_indices) // self.page_size
 
         # fast path
-        if (int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
-                and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1):
+        if (
+            int(host_indices[-1].item()) == int(host_indices[0].item()) + len(host_indices) - 1
+            and int(cuda_indices[-1].item()) == int(cuda_indices[0].item()) + len(cuda_indices) - 1
+        ):
             host_page_start = int(host_indices[0].item()) // self.page_size
             cuda_page_start = int(cuda_indices[0].item()) // self.page_size
 
-            self._cuda_page[0][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[0][host_page_start:host_page_start + num_pages],
+            self._cuda_page[0][cuda_page_start : cuda_page_start + num_pages].copy_(
+                self._host_page[0][host_page_start : host_page_start + num_pages],
                 non_blocking=True,
             )
-            self._cuda_page[1][cuda_page_start:cuda_page_start + num_pages].copy_(
-                self._host_page[1][host_page_start:host_page_start + num_pages],
+            self._cuda_page[1][cuda_page_start : cuda_page_start + num_pages].copy_(
+                self._host_page[1][host_page_start : host_page_start + num_pages],
                 non_blocking=True,
             )
             return
@@ -165,11 +174,11 @@ class HiCacheTransferMixin:
 
 class HiCacheController(HiCacheTransferMixin):
     def __init__(
-            self,
-            prefix_cache: BasePrefixCache,
-            num_pages: int,
-            config: SchedulerConfig,
-            free_cuda_slots: Callable[[torch.Tensor], None],
+        self,
+        prefix_cache: BasePrefixCache,
+        num_pages: int,
+        config: SchedulerConfig,
+        free_cuda_slots: Callable[[torch.Tensor], None],
     ):
         self.hiradix_cache = cast("HiRadixPrefixCache", prefix_cache)
         self.free_cuda_slots = free_cuda_slots
@@ -191,9 +200,10 @@ class HiCacheController(HiCacheTransferMixin):
         self.ring_index = 0
         self.counter_ring_buffer = [HiCacheCounter(self.num_layers) for _ in range(RING_SIZE)]
         self.token_bytes = self.cuda_pool.get_per_token_bytes()
+        self.layerwise_prefill_durations_ms = [0.0 for _ in range(self.num_layers)]
         num_host_pages = int(num_pages * config.hicache_ratio)
         num_host_tokens = num_host_pages * config.page_size
-        total_bytes_gb = num_host_tokens * self.token_bytes / (1024 ** 3)
+        total_bytes_gb = num_host_tokens * self.token_bytes / (1024**3)
         self.free_slots = torch.arange(num_host_tokens, dtype=torch.int32, device="cpu")
         logger.info(
             f"Allocating {num_host_tokens} tokens "
@@ -209,10 +219,10 @@ class HiCacheController(HiCacheTransferMixin):
         )
 
     def prepare_load(
-            self,
-            host_handle: BaseCacheHandle,
-            cuda_handle: BaseCacheHandle,
-            cuda_indices: torch.Tensor,
+        self,
+        host_handle: BaseCacheHandle,
+        cuda_handle: BaseCacheHandle,
+        cuda_indices: torch.Tensor,
     ) -> None:
         host_list = self.hiradix_cache.set_cuda(host_handle, cuda_indices)
         self.hiradix_cache.lock_handle(host_handle, unlock=False)
@@ -233,7 +243,7 @@ class HiCacheController(HiCacheTransferMixin):
         self.write_queue.append(Transaction(cuda_handle, [host_indices], cuda_list, demote_len))
         self.start_write()  # do not batch write for now
 
-    def start_load(self) -> None:
+    def start_load(self, is_prefill: bool = True) -> None:
         if not self.load_queue:
             return self.cuda_pool.set_hicache_counter(None)
         self.ring_index = (self.ring_index + 1) % RING_SIZE
@@ -248,6 +258,7 @@ class HiCacheController(HiCacheTransferMixin):
             self.load_stream.wait_stream(current_stream)
             if self.use_layerwise:
                 for i in range(self.num_layers):
+                    counter.layer_start_events[i].record(self.load_stream)
                     self.load_one(host_indices, cuda_indices, i)
                     counter.events[i].record(self.load_stream)
             elif self.pagewise_load:
@@ -261,7 +272,23 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.load_stream)
         self.load_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_load_queue.append(Ack(ack_id, [], [], num_tokens, counter.start_event, counter.finish_event))
+        layer_start_events = (
+            counter.layer_start_events if self.use_layerwise and is_prefill else None
+        )
+        layer_finish_events = counter.events if self.use_layerwise and is_prefill else None
+        self.ack_load_queue.append(
+            Ack(
+                ack_id,
+                [],
+                [],
+                num_tokens,
+                counter.start_event,
+                counter.finish_event,
+                is_prefill,
+                layer_start_events,
+                layer_finish_events,
+            )
+        )
         logger.info_rank0(f"HiCache Load  [{ack_id}]: {num_tokens:>5} tokens")
 
     def start_write(self) -> None:
@@ -285,7 +312,9 @@ class HiCacheController(HiCacheTransferMixin):
         cuda_indices.record_stream(self.write_stream)
         self.write_queue.clear()
         ack_id = self._allocate_ack_id()
-        self.ack_write_queue.append(Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event))
+        self.ack_write_queue.append(
+            Ack(ack_id, handles, demote_lens, num_tokens, start_event, finish_event)
+        )
         logger.info_rank0(f"HiCache Write [{ack_id}]: {num_tokens:>5} tokens")
 
     def refresh(self, tp_cpu_group: torch.distributed.ProcessGroup) -> None:
@@ -296,6 +325,7 @@ class HiCacheController(HiCacheTransferMixin):
                 break
             finish_count += 1
             self._log_transaction(ack, "Load ")
+            self._log_layerwise_prefill_durations(ack)
         self.ack_load_queue = self.ack_load_queue[finish_count:]
 
         finish_count = 0
@@ -359,9 +389,33 @@ class HiCacheController(HiCacheTransferMixin):
         self.ack_cnt = (self.ack_cnt + 1) % RESET_ACK_THRESHOLD
         return self.ack_cnt
 
+    def _log_layerwise_prefill_durations(self, ack: Ack) -> None:
+        if not (self.use_layerwise and ack.is_prefill):
+            return
+        if ack.layer_start_events is None or ack.layer_finish_events is None:
+            return
+
+        layer_durations = [
+            start_event.elapsed_time(finish_event)
+            for start_event, finish_event in zip(ack.layer_start_events, ack.layer_finish_events)
+        ]
+        for i, dur in enumerate(layer_durations):
+            self.layerwise_prefill_durations_ms[i] += dur
+
+        per_layer_msg = ", ".join(
+            f"L{i}={dur:.2f}/{total:.2f}"
+            for i, (dur, total) in enumerate(
+                zip(layer_durations, self.layerwise_prefill_durations_ms)
+            )
+        )
+        logger.info(
+            f"HiCache Load  [{ack.ack_id}] layer-wise prefill duration ms "
+            f"(current/total): {per_layer_msg}"
+        )
+
     def _log_transaction(self, ack: Ack, stage: str):
         dur = ack.start_event.elapsed_time(ack.finish_event)
-        bandwidth = (self.token_bytes * ack.num_tokens / (1024 ** 3)) / (dur / 1000)
+        bandwidth = (self.token_bytes * ack.num_tokens / (1024**3)) / (dur / 1000)
         logger.info(
             f"HiCache {stage} [{ack.ack_id}]: {ack.num_tokens:>5} tokens: "
             f"duration = {dur:>5.2f} ms, bandwidth = {bandwidth:>5.2f} GB/s"
