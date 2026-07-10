@@ -16,6 +16,11 @@ class TokenizeManager:
         # TODO: batch tokenization
         for msg in msgs:
             if isinstance(msg.text, list):
+                if not msg.text or isinstance(msg.text[0], int):
+                    input_ids = torch.tensor(msg.text, dtype=torch.int32, device="cpu")
+                    results.append(input_ids)
+                    continue
+
                 prompt = self.tokenizer.apply_chat_template(
                     msg.text,
                     tokenize=False,

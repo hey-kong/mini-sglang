@@ -67,7 +67,7 @@ class OpenAICompletionRequest(BaseModel):
 
     model: str
 
-    prompt: str | None = None
+    prompt: str | List[int] | None = None
     messages: List[Message] | None = None
 
     max_tokens: int = 16
