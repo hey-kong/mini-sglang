@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,41 @@ def torch_dtype(dtype: torch.dtype):
         torch.set_default_dtype(old_dtype)
 
 
+_NVTX_STATE = threading.local()
+
+
+def _nvtx_stack() -> list[str]:
+    stack = getattr(_NVTX_STATE, "stack", None)
+    if stack is None:
+        stack = []
+        _NVTX_STATE.stack = stack
+    return stack
+
+
+@contextmanager
+def nvtx_pause_current_ranges():
+    """Temporarily suspend ranges opened by :func:`nvtx_annotate`.
+
+    This is useful for stream waits that must be enqueued in the middle of a
+    layer.  The wait operation is emitted outside the layer NVTX range, then the
+    range is reopened with the same name so profiler aggregations report pure
+    layer compute time instead of compute plus the stream-wait gap.
+    """
+    import torch.cuda.nvtx as nvtx
+
+    stack = _nvtx_stack()
+    paused = stack.copy()
+    for _ in reversed(paused):
+        nvtx.range_pop()
+    stack.clear()
+    try:
+        yield
+    finally:
+        for display_name in paused:
+            nvtx.range_push(display_name)
+            stack.append(display_name)
+
+
 def nvtx_annotate(name: str, layer_id_field: str | None = None):
     import torch.cuda.nvtx as nvtx
 
@@ -29,8 +65,27 @@ def nvtx_annotate(name: str, layer_id_field: str | None = None):
             display_name = name
             if layer_id_field and hasattr(self, layer_id_field):
                 display_name = name.format(getattr(self, layer_id_field))
-            with nvtx.range(display_name):
+            timer = None
+            layer_id = None
+            if layer_id_field and hasattr(self, layer_id_field):
+                from minisgl.core import get_global_ctx_optional
+
+                ctx = get_global_ctx_optional()
+                timer = ctx.prefill_layer_timer if ctx is not None else None
+                layer_id = getattr(self, layer_id_field)
+                if timer is not None:
+                    timer.start_layer(layer_id)
+
+            stack = _nvtx_stack()
+            nvtx.range_push(display_name)
+            stack.append(display_name)
+            try:
                 return fn(self, *args, **kwargs)
+            finally:
+                if timer is not None:
+                    timer.end_layer(layer_id)
+                stack.pop()
+                nvtx.range_pop()
 
         return wrapper
 

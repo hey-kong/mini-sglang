@@ -86,7 +86,19 @@ class MHAKVCache(BaseKVCachePool):
             v=v,
         )
         if self.counter is not None:
-            self.counter.wait(layer_id)
+            from minisgl.core import get_global_ctx_optional
+            from minisgl.utils import nvtx_pause_current_ranges
+
+            ctx = get_global_ctx_optional()
+            timer = ctx.prefill_layer_timer if ctx is not None else None
+            if timer is not None:
+                timer.pause_layer(layer_id)
+            try:
+                with nvtx_pause_current_ranges():
+                    self.counter.wait(layer_id)
+            finally:
+                if timer is not None:
+                    timer.resume_layer(layer_id)
 
     def get_per_token_bytes(self) -> int:
         num_layers, _, _, local_kv_heads, head_dim = self.k_buffer.shape
